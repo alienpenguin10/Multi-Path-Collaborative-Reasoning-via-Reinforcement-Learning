@@ -1,7 +1,7 @@
-./logs
-./Notes
-./unsloth_compiled_cache
-./outputs
+logs/
+Notes/
+unsloth_compiled_cache/
+outputs/
 Figures/
 Papers/
 Writeup/
@@ -10,4 +10,5 @@ __pycache__/
 checkpoint*/
 wandb/
 .env
-./trained_models
+trained_models/
+Reports/
