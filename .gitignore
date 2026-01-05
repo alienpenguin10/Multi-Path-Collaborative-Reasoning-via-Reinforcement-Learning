@@ -1,0 +1,12 @@
+./logs
+./Notes
+./unsloth_compiled_cache
+./outputs
+Figures/
+Papers/
+Writeup/
+miniconda3/
+__pycache__/
+checkpoint*/
+wandb/
+.env
