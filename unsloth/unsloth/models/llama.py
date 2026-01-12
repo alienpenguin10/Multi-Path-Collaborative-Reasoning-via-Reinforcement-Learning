@@ -726,7 +726,6 @@ __DTYPE_MAP = {
 
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L825
-# NOTE: Training Path FOR HRPO
 def LlamaModel_fast_forward(
     self,
     input_ids: Optional[torch.LongTensor] = None,
@@ -759,17 +758,11 @@ def LlamaModel_fast_forward(
         return_dict if return_dict is not None else self.config.use_return_dict
     )
 
-    # NOTE: HRPO MOD: During training it replaces embeddings on "thinking" positions with the gated mix; 
-    # during fast decoding it blends the current token embedding with the previous latent state 
-    # and stores (thinking_embeds, thinking_mask, embeds_ratio) in hidden_states so generate can retrieve them.
     # retrieve input_ids and inputs_embeds
     if input_ids is not None and inputs_embeds is not None:
-        # NOTE: HRPO MOD: thinking_embeds and inputs_embeds
-        thinking_embeds = inputs_embeds
-        batch_size, seq_length, _ = inputs_embeds.shape
-        # raise ValueError(
-        #     "Unsloth: You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
-        # )
+        raise ValueError(
+            "Unsloth: You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+        )
     elif input_ids is not None:
         batch_size, seq_length = input_ids.shape
     elif inputs_embeds is not None:
@@ -824,23 +817,6 @@ def LlamaModel_fast_forward(
     # Embed positions
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
-    # NOTE: HRPO MOD: thinking_embeds and inputs_embeds
-    thinking_mask = kwargs.get('thinking_mask') # It retrieves thinking_mask from kwargs.
-    if thinking_mask is not None:
-        new_inputs_embeds = inputs_embeds.clone()
-        # It applies the thinking_residual to inputs_embeds masked by thinking_mask.
-        """
-        Re-apply blending with gradients enabled
-        Allow backprop to update thinking_residual parameters (Lambda, gate_r, gate_i)
-        Reconstruct the forward pass so we can compute loss and learn
-        If new_inputs_embeds[thinking_mask] = stored_blended_embeddings[thinking_mask]
-        Lambda, gate_r, gate_i would never be updated
-        The model couldn't learn when/how to blend
-        """
-        new_inputs_embeds[thinking_mask] = self.thinking_residual(
-            inputs_embeds[thinking_mask], thinking_embeds[thinking_mask],
-        )[0].to(inputs_embeds.dtype)
-        inputs_embeds = new_inputs_embeds
 
     inputs_embeds = inputs_embeds.to(_get_dtype(dtype_from_config(self.config)))
 
@@ -1153,7 +1129,6 @@ def LlamaModel_fast_forward(
 
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L825
-# NOTE: Inference Path FOR HRPO
 def _LlamaModel_fast_forward_inference(
     attention_fast_forward_inference = LlamaAttention_fast_forward_inference,
     mlp_fast_forward_inference = fast_swiglu_inference,
@@ -1166,54 +1141,15 @@ def _LlamaModel_fast_forward_inference(
         past_key_values,
         position_ids,
         attention_mask = None,
-        **kwargs, # NOTE: need to etrieve is_thinking and last_thinking_states from kwargs
+        **kwargs,
     ):
         input_ids = input_ids[:, : self.max_seq_length]
         bsz, q_len = input_ids.shape
         hd = self.config.hidden_size
         mlp_size = self.config.intermediate_size
-        #print(f"Input ID is {input_ids}")
+
         X = self.model.embed_tokens(input_ids)
-        #print(f"Embedding is {X}")
         X = X.to(_get_dtype(dtype_from_config(self.config)))
-        #print(f"Embedding dtype after conversion is {X.dtype} with shape {X.shape}")
-
-        # NOTE: HRPO MOD: thinking_embeds and X
-        # applies thinking_residual for blending states during generation.
-        is_thinking = kwargs.get('is_thinking')
-        last_thinking_states = kwargs.get('last_thinking_states')
-        thinking_embeds = last_thinking_states
-        embeds_ratio = None
-        
-        # NOTE
-        # DEBUG: Track first call
-        # if not hasattr(self.model, '_debug_thinking_count'):
-        #     self.model._debug_thinking_count = 0
-        
-        if is_thinking is not None and last_thinking_states is not None:
-            thinking_embeds = last_thinking_states
-            X_hat, a_t = self.model.thinking_residual(X, last_thinking_states.unsqueeze(1),)
-            embeds_ratio = a_t.mean(-1).squeeze()
-            is_thinking_tensor = torch.tensor(is_thinking, device=embeds_ratio.device)
-            if is_thinking_tensor.ndim == 0:
-                is_thinking_tensor = is_thinking_tensor.unsqueeze(0)
-            if embeds_ratio.ndim == 0:
-                 embeds_ratio = embeds_ratio.unsqueeze(0)
-                 
-            embeds_ratio[~is_thinking_tensor] = 1.
-            
-            # DEBUG: Print for first few calls
-            # if self.model._debug_thinking_count < 20:
-            #     print(f"\n  🧠 HYBRID BLENDING From LlamaModel_fast_forward_inference_custom 🦥 llama (call {self.model._debug_thinking_count + 1}):")
-            #     print(f"    Token embedding norm: {X[0, 0].norm():.4f}")
-            #     print(f"    Hidden state norm: {last_thinking_states[0].norm():.4f}")
-            #     print(f"    Blended output norm: {X_hat[0, 0].norm():.4f}")
-            #     print(f"    Embeds ratio (a_t): {embeds_ratio[0].item():.4f} -> {embeds_ratio[0].item()*100:.1f}% token")
-            #     print(f"    Hidden ratio: {torch.sqrt(1-embeds_ratio[0]**2).item():.4f} -> {torch.sqrt(1-embeds_ratio[0]**2).item()*100:.1f}% hidden")
-            #     self.model._debug_thinking_count += 1
-            
-            X[is_thinking] = X_hat[is_thinking].to(X.dtype)
-
         bsz, q_len, hd = X.shape
         assert q_len == 1
         # Get saved buffers to reduce memory movement
@@ -1300,8 +1236,7 @@ def _LlamaModel_fast_forward_inference(
         return BaseModelOutputWithPast(
             last_hidden_state = X,
             past_key_values = next_decoder_cache,
-            # NOTE: HRPO returns the thinking info in hidden_states.
-            hidden_states = [] if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio],
+            hidden_states = [],
             attentions = [],
         )
 
@@ -2905,8 +2840,6 @@ class FastLlamaModel:
 
         train_lm_head = False
         train_embed_tokens = False
-        # NOTE: HRPO MOD: thinking_residual
-        train_thinking_residual = False
         final_modules = []
         for module in target_modules:
             if module == "lm_head":
@@ -2930,11 +2863,6 @@ class FastLlamaModel:
                     modules_to_save = ["embed_tokens"]
                 else:
                     modules_to_save.append("embed_tokens")
-            # NOTE: HRPO MOD: thinking_residual
-            elif "thinking_residual" in module:
-                train_thinking_residual = True
-                if modules_to_save is None: modules_to_save = [module]
-                else: modules_to_save = list(set(modules_to_save).add(module))
 
             else:
                 try:
@@ -2986,13 +2914,10 @@ class FastLlamaModel:
                     train_lm_head = True
                 elif module == "embed_tokens":
                     train_embed_tokens = True
-                # NOTE: HRPO MOD: thinking_residual
-                elif "thinking_residual" in module:
-                    train_thinking_residual = True
                 else:
                     raise TypeError(
-                        f"Unsloth: Module = {module} is not allowed. Only 'lm_head', 'embed_tokens' and 'thinking_residual' are allowed."
-                    ) #NOTE: HRPO MOD: thinking_residual
+                        f"Unsloth: Module = {module} is not allowed. Only 'lm_head' and 'embed_tokens' is allowed."
+                    )
         if isinstance(modules_to_save, (tuple, list)):
             modules_to_save = list(set(modules_to_save))
 
@@ -3110,30 +3035,7 @@ class FastLlamaModel:
                 device = DEVICE_TYPE_TORCH, dtype = new_dtype, non_blocking = True
             )
             model.get_output_embeddings().modules_to_save.default.requires_grad_(True)
-        # NOTE: HRPO MOD: thinking_residual
-        if train_thinking_residual:
-            print("Unsloth: Training thinking_residual in mixed precision to save VRAM")
-            try:
-                new_dtype = model.get_input_embeddings().weight.dtype
-            except:
-                new_dtype = model.get_input_embeddings().modules_to_save.default.weight.dtype
 
-            for module in modules_to_save:
-                if "thinking_residual_gate_r" in module:
-                    assert(hasattr(model.model.model.thinking_residual_gate_r, "modules_to_save"))
-                    model.model.model.thinking_residual_gate_r.modules_to_save.default\
-                        .to(device = "cuda", dtype = new_dtype, non_blocking = True)
-                    model.model.model.thinking_residual_gate_r.modules_to_save.default.requires_grad_(True)
-                if "thinking_residual_gate_i" in module:
-                    assert(hasattr(model.model.model.thinking_residual_gate_i, "modules_to_save"))
-                    model.model.model.thinking_residual_gate_i.modules_to_save.default\
-                        .to(device = "cuda", dtype = new_dtype, non_blocking = True)
-                    model.model.model.thinking_residual_gate_i.modules_to_save.default.requires_grad_(True)
-                if "thinking_residual_Lambda" in module:
-                    model.model.model.thinking_residual_Lambda.modules_to_save.default\
-                        .to(device = "cuda", dtype = torch.float32, non_blocking = True)
-                    model.model.model.thinking_residual_Lambda.modules_to_save.default.requires_grad_(True)
-        
         # Patch tokenizer to pad to the right
         internal_model = model
         while hasattr(internal_model, "model"):

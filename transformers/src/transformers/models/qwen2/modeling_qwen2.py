@@ -305,26 +305,6 @@ class Qwen2RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-#NOTE: Defining ThinkingResidualLambda
-class ThinkingResidualLambda(nn.Module):
-    c = 0.8
-    def __init__(self, config: Qwen2Config):
-        super().__init__()
-        # learnable parameter tensor, initialized with random values from a normal distribution
-        self.Lambda = nn.Parameter(torch.randn(config.hidden_size))
-    
-    def reset_lambda_parameters(self, r_min=0.9, r_max=0.999):
-        # custom initialization strategy for lambda
-        # samples value between r_min and r_max, then applies an inverse sigmoid transformation
-        # lambda values start in a specific range <- that corresponds to desired initial gating behavior
-        nn.init.uniform_(self.Lambda, a=r_min, b=r_max)
-        self.Lambda.data.copy_(- torch.log((self.Lambda ** (-1 / self.c)) - 1))
-    
-    def forward(self, r_t):
-        # produces a gating coefficient between 0 and 1 that element-wise multiplies the input r_t
-        # learn how much of the residual signal to retain or suppress at each hidden dimension, providing adaptive control over information flow in the model.
-        a_t = torch.exp(-self.c * nn.functional.softplus(-self.Lambda, beta=1, threshold=20) * r_t) 
-        return a_t
 
 @auto_docstring
 class Qwen2Model(Qwen2PreTrainedModel):
@@ -341,20 +321,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-        #NOTE: Defining Thinking Residual Components
-        self.thinking_residual_gate_r = nn.Linear(config.hidden_size, config.hidden_size)
-        self.thinking_residual_gate_i = nn.Linear(config.hidden_size, config.hidden_size)
-        self.thinking_residual_Lambda = ThinkingResidualLambda(config)
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    #NOTE: THINKING RESIDUAL
-    def thinking_residual(self, embeds, residual, eps=1e-8):
-        r_t = torch.sigmoid(self.thinking_residual_gate_r(embeds))
-        a_t = self.thinking_residual_Lambda(r_t)
-        i_t = torch.sigmoid(self.thinking_residual_gate_i(embeds))
-        return a_t * embeds + torch.sqrt(1 - a_t.pow(2) + eps) * (i_t * residual), a_t
 
     @check_model_inputs()
     @auto_docstring

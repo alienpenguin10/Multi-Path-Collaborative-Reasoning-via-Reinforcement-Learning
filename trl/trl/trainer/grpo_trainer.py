@@ -372,12 +372,6 @@ class GRPOTrainer(BaseTrainer):
                 "`importance_sampling_level` to 'token'."
             )
 
-        # NOTE: HRPO MOD: return_thinking_embeds
-        # NOTE: M3PO MOD: enable_cross_path
-        self.enable_cross_path = args.enable_cross_path
-        self.cross_path_lambda = args.cross_path_lambda
-        self.cross_path_temp = args.cross_path_temp
-
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
 
@@ -803,8 +797,6 @@ class GRPOTrainer(BaseTrainer):
         pixel_attention_mask=None,
         image_sizes=None,
         token_type_ids=None,
-        # HRPO: Add kwargs to capture thinking args
-        **kwargs,
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
@@ -834,13 +826,6 @@ class GRPOTrainer(BaseTrainer):
                 model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
             if token_type_ids is not None:
                 model_inputs["token_type_ids"] = token_type_ids[start : start + batch_size]
-            
-            # HRPO: Handle thinking tensors if present
-            thinking_embeds = kwargs.get("thinking_embeds")
-            thinking_mask = kwargs.get("thinking_mask")
-            if thinking_embeds is not None and thinking_mask is not None:
-                model_inputs["thinking_embeds"] = thinking_embeds[start : start + batch_size]
-                model_inputs["thinking_mask"]   = thinking_mask[start : start + batch_size]
 
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
@@ -1016,10 +1001,6 @@ class GRPOTrainer(BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
-                """
-                VARNIE LEARNING:
-                8 prompts and your num_generations is 8, the model actually creates a "Mega-Batch" of 64 total sequences (8 prompts×8 generations per prompt).
-                """
                 generation_batch = self._generate_and_score_completions(generation_batch)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
@@ -1299,9 +1280,6 @@ class GRPOTrainer(BaseTrainer):
                 **kwargs,
             )
             generate_inputs = super()._prepare_inputs(generate_inputs)
-            #NOTE:  HRPO MOD
-            prompt_ids = generate_inputs["input_ids"]
-            prompt_mask = generate_inputs["attention_mask"]
 
             with (
                 profiling_context(self, "transformers.generate"),
@@ -1311,43 +1289,9 @@ class GRPOTrainer(BaseTrainer):
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
-                # DEBUG: Track first generation
-                # if not hasattr(self, '_debug_gen_count'):
-                #     self._debug_gen_count = 0
-                #     print("\n" + "🚀"*40)
-                #     print("STARTING GRPO TRAINING WITH HYBRID REASONING FROM _generate_single_turn 💪 GRPO")
-                #     print("🚀"*40 + "\n")
-                
-                # NOTE: HRPO MOD: thinking_embeds and inputs_embeds
-                # grpo_trainer.py asks generate to return thinking data and keeps it in the batch 
-                # so the RL loss can use latent-state trajectories (mirroring the paper's "hybrid rollout buffer").
-                prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio = unwrapped_model.generate(
-                    **generate_inputs,
-                    generation_config=self.generation_config,
-                    processing_class=self.processing_class,
-                    return_thinking_embeds=True,
-                    enable_cross_path=True, #NOTE: M3PO Enable 
-                    cross_path_lambda=0.1, #NOTE: M3PO blending coefficient
-                    cross_path_temp=0.1, #NOTE: M3PO temperature
-                    num_generations = self.num_generations,
-                    disable_compile=True 
+                prompt_completion_ids = unwrapped_model.generate(
+                    **generate_inputs, generation_config=self.generation_config, disable_compile=True
                 )
-                
-                # DEBUG: Print for first generation
-                # if self._debug_gen_count == 0:
-                #     print(f"\n{'='*80}")
-                #     print("📦 ROLLOUT BUFFER From _generate_single_turn 💪GRPO after unwrapped_model.generate (First Example):")
-                #     print(f"{'='*80}")
-                #     print(f"Completion length: {thinking_embeds.shape[1]}")
-                #     print(f"Thinking embeddings shape: {thinking_embeds.shape}")
-                #     print(f"Thinking mask shape: {thinking_mask.shape}")
-                #     print(f"Embeds ratio shape: {embeds_ratio.shape}")
-                #     print(f"Thinking tokens: {thinking_mask[0].sum().item()}")
-                #     if thinking_mask[0].sum() > 0:
-                #         avg_ratio = embeds_ratio[0][thinking_mask[0]].mean()
-                #         print(f"Avg embeds ratio during thinking: {avg_ratio:.4f}")
-                #         print(f"Avg hidden ratio during thinking: {torch.sqrt(1-avg_ratio**2):.4f}")
-                #     self._debug_gen_count += 1
             # Compute prompt length and extract completion ids
             prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
             prompt_length = prompt_ids.size(1)
@@ -1362,21 +1306,14 @@ class GRPOTrainer(BaseTrainer):
             prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
             completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool())]
             logprobs = None  # not used in this case
-            # NOTE: HRPO MOD: thinking_embeds and inputs_embeds
-            # return thinking_embeds, thinking_mask, embeds_ratio, ref_per_token_logps, advantages
-            if thinking_embeds is not None:
-                thinking_embeds = [t for t in thinking_embeds]
-                thinking_mask = [t for t in thinking_mask]
-        return prompt_ids, completion_ids, logprobs, forward_kwargs, thinking_embeds, thinking_mask, embeds_ratio
+
+        return prompt_ids, completion_ids, logprobs, forward_kwargs
 
     def _generate(self, prompts: list[str], images: Optional[list]):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        (
-            prompt_ids, completion_ids, logprobs, forward_kwargs, 
-            thinking_embeds, thinking_mask, embeds_ratio
-        ) = self._generate_single_turn(prompts, images)
+        prompt_ids, completion_ids, logprobs, forward_kwargs = self._generate_single_turn(prompts, images)
 
         # Get completion length per sequence, used for logging
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
@@ -1407,11 +1344,8 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
-        # NOTE: HRPO Return thinking tensors
-        return (
-            prompt_ids, completion_ids, total_completion_tokens, logprobs, forward_kwargs,
-            thinking_embeds, thinking_mask, embeds_ratio
-        )
+
+        return prompt_ids, completion_ids, total_completion_tokens, logprobs, forward_kwargs
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
@@ -1437,9 +1371,6 @@ class GRPOTrainer(BaseTrainer):
             num_items_in_batch,
             sampling_per_token_logps_list,
             forward_kwargs,
-            thinking_embeds, # NOTE: HRPO - Return thinking data
-            thinking_mask,
-            embeds_ratio
         ) = self._generate(prompts, images)
 
         # Convert lists of token IDs to padded tensors
@@ -1490,9 +1421,6 @@ class GRPOTrainer(BaseTrainer):
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
             ):
-                if "thinking_embeds" in forward_kwargs: # HRPO: Remove thinking_embeds from forward_kwargs if present, it is not used for old_per_token_logps I guess? Wait, if we use thinking, we SHOULD pass it.
-                     pass 
-
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
@@ -1500,8 +1428,6 @@ class GRPOTrainer(BaseTrainer):
                     logits_to_keep,
                     batch_size,
                     num_images=num_images,
-                    thinking_embeds=thinking_embeds, # HRPO: Pass thinking embeds
-                    thinking_mask=thinking_mask,     # HRPO: Pass thinking mask
                     **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
                 )
             else:
@@ -1542,15 +1468,7 @@ class GRPOTrainer(BaseTrainer):
 
         # Decode
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
-        # DEBUG: PRINTINING ALL THE PROMPTS
-        # print("GONNA PRINT ALL PROMPTS FROM _generate_and_score_completions 💪 GRPO")
-        # for prompt in  prompts_text:
-        #     print(prompt)
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        # # DEBUG: PRINTING ALL THE COMPLETIONS
-        # print("GONNA PRINT ALL COMPLETIONS FROM _generate_and_score_completions 💪 GRPO")
-        # for completion in completions_text:
-        #     print(completion)
         if is_conversational(inputs[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
@@ -1573,19 +1491,6 @@ class GRPOTrainer(BaseTrainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = rewards - mean_grouped_rewards
-        
-        # DEBUG: Print for first batch
-        # if not hasattr(self, '_debug_reward_count'):
-        #     self._debug_reward_count = 0
-        
-        # if self._debug_reward_count == 0:
-        #     print(f"\n{'='*80}")
-        #     print("🎯 REWARDS & ADVANTAGES FROM _generate_and_score_completions 💪 GRPO (First Prompt, All Generations):")
-        #     print(f"{'='*80}")
-        #     for i in range(min(rewards.shape[0], 4)):  # Show first 4 generations
-        #         print(f"  Gen {i+1}: Reward={rewards[i].item():.4f}, Advantage={advantages[i].item():.4f}")
-        #     print(f"  Mean grouped reward: {mean_grouped_rewards[0].item():.4f}")
-        #     self._debug_reward_count += 1
 
         if self.scale_rewards in ["group", "none"]:
             # If self.scale_rewards = "none", we'll still log group level std
@@ -1689,16 +1594,6 @@ class GRPOTrainer(BaseTrainer):
             output["token_type_ids"] = forward_kwargs["token_type_ids"]
         if images is not None:
             output["num_images"] = num_images
-        
-        if thinking_embeds is not None:
-            # HRPO: We need to pad thinking_embeds and thinking_mask
-            # NOTE: thinking_embeds are tensors, so we can use pad
-            thinking_embeds = [t.to(device) for t in thinking_embeds]
-            thinking_mask = [t.to(device) for t in thinking_mask]
-            
-            output["thinking_embeds"] = pad(thinking_embeds, padding_value=0.0, padding_side="right")
-            output["thinking_mask"]   = pad(thinking_mask, padding_value=0, padding_side="right")
-        
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -1761,10 +1656,6 @@ class GRPOTrainer(BaseTrainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        
-        # HRPO: Retrieve thinking tensors
-        thinking_embeds = inputs.get("thinking_embeds")
-        thinking_mask = inputs.get("thinking_mask")
 
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
@@ -1779,8 +1670,6 @@ class GRPOTrainer(BaseTrainer):
             pixel_attention_mask=inputs.get("pixel_attention_mask"),
             image_sizes=inputs.get("image_sizes"),
             token_type_ids=inputs.get("token_type_ids"),
-            thinking_embeds=thinking_embeds, # HRPO
-            thinking_mask=thinking_mask,     # HRPO
         )
 
         if self.top_entropy_quantile < 1.0:

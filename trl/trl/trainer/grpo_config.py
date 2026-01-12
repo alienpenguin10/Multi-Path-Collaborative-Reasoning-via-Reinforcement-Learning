@@ -395,20 +395,6 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "Implementation of the cache method for faster generation when use_vllm is set to False."},
     )
 
-    # NOTE: M3PO Parameters
-    enable_cross_path: bool = field(
-        default=True,
-        metadata={"help": "Enable cross-path interaction during thinking phase (M3PO)"},
-    )
-    cross_path_lambda: float = field(
-        default=0.1,
-        metadata={"help": "Blending coefficient for cross-path contextual embeddings (default: 0.1)"},
-    )
-    cross_path_temp: float = field(
-        default=0.1,
-        metadata={"help": "Temperature for softmax in cross-path attention weights (default: 0.1)"},
-    )
-
     # Parameters that control generation acceleration powered by vLLM
     use_vllm: bool = field(
         default=False,
