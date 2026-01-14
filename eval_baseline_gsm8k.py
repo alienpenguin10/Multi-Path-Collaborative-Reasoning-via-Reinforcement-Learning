@@ -83,11 +83,30 @@ def evaluate_model(
         prompt_length = prompt_ids.size(1)
 
         # Generate responses
+        if is_inference:  # Use greedy decoding for evaluation
+            outputs = model.generate(
+                prompt_ids, 
+                attention_mask=prompt_mask, 
+                generation_config=GenerationConfig(
+                    do_sample=False,  # Greedy decoding
+                    max_new_tokens=512,
+                ),
+            )
+        else:  # Use sampling (for analysis/diversity)
+            outputs = model.generate(
+                prompt_ids, 
+                attention_mask=prompt_mask, 
+                generation_config=GenerationConfig(
+                    do_sample=True,
+                    temperature=temperature,
+                    max_new_tokens=512,
+                ),
+            )
         outputs = model.generate(
             prompt_ids, attention_mask=prompt_mask, 
             generation_config=GenerationConfig(
-                do_sample=True,  # for temperature, top-k, etc.
-                temperature=temperature,
+                do_sample=False,  # for temperature, top-k, etc.
+                # temperature=temperature,
                 max_new_tokens=512,
             ),
         )
@@ -150,25 +169,40 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--greedy", type=bool, default=True)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--checkpoint_path", type=str, default=None)
+    parser.add_argument("--model_path", type=str, required=True, help="HuggingFace model ID or local path")
+    parser.add_argument("--temperature", type=float, default=0.5, help="Temperature (only used for metadata)")
+    parser.add_argument("--force_eval", action="store_true", help="Run evaluation even if results exist")
     args = parser.parse_args()
 
-    base_model = None
-    checkpoint_path = args.checkpoint_path
-    base_models = ["Qwen/Qwen2.5-1.5B-Instruct"]
-    for model in base_models:
-        if model.split('/')[-1] in checkpoint_path:
-            base_model = model
-    temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
-    print(checkpoint_path, base_model, temperature)
+    model_path = args.model_path
+    temperature = args.temperature
 
-    if 'eval_results.json' not in os.listdir(checkpoint_path):
-        print(f"Starting GSM8k evaluation on {checkpoint_path}")
+    # Try to extract temperature from model path if it contains -temp
+    if '-temp' in model_path:
+        try:
+            temperature = float(model_path.split('-temp')[-1].split('/')[0].split('-')[0])
+        except ValueError:
+            pass
+
+    print(f"Model: {model_path}, Temperature: {temperature}")
+
+    # Check if results already exist (only for local paths)
+    should_run = args.force_eval
+    if not should_run:
+        if os.path.isdir(model_path):
+            should_run = 'eval_results.json' not in os.listdir(model_path)
+        else:
+            should_run = True  # HuggingFace model, always run
+
+    if should_run:
+        print(f"Starting GSM8k evaluation on {model_path}")
         metrics = evaluate_model(
-            model_path=checkpoint_path,
+            model_path=model_path,
             temperature=temperature,
             is_inference=args.greedy,
             batch_size=args.batch_size,
             num_samples=None,
             save_results=True,
         )
+    else:
+        print(f"Evaluation results already exist for {model_path}. Use --force_eval to re-run.")
