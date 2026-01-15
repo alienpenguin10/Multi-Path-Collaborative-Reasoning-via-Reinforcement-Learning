@@ -1,9 +1,16 @@
 import os
+import sys
+
+# Fix shadowing of installed packages by local directories
+sys.path.insert(0, os.path.abspath("unsloth"))
+sys.path.insert(0, os.path.abspath("transformers/src"))
+sys.path.insert(0, os.path.abspath("trl"))
+
 import re
 import torch
 import argparse
 from torch.nn.parallel import DistributedDataParallel
-
+from patch import patch_trainer_optimizer
 # [FIX] Patch DDP class to automatically expose .config from the internal module
 @property
 def ddp_config_patch(self):
@@ -14,6 +21,8 @@ DistributedDataParallel.config = ddp_config_patch
 
 # Wandb Configuration
 os.environ["WANDB_PROJECT"] = "latent-space-reasoning"
+os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
+
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="GRPO Training on GSM8k")
@@ -57,6 +66,10 @@ load_in_8bit = False
 # GRPO Training Hyperparameters (from args)
 lora_rank = args.lora_rank
 lora_alpha = lora_rank * 2  # lora_rank * 2 as in hrpo
+residual_r_min = 0.99  # HRPO parameters
+residual_r_max = 0.999  # HRPO parameters
+lr_residual_gate = 1e-4  # HRPO parameters
+lr_residual_lambda = 1e-3  # HRPO parameters
 per_device_train_batch_size = args.per_device_train_batch_size
 gradient_accumulation_steps = args.gradient_accumulation_steps if args.gradient_accumulation_steps else max(1, int(8 / per_device_train_batch_size / WORLD_SIZE))
 num_train_epochs = args.num_train_epochs
@@ -73,6 +86,8 @@ temperature = args.temperature
 ft_dataset_name = "openai/gsm8k"
 q_column = "question"
 a_column = "answer"
+
+ANSWER_START = "####"
 
 
 from unsloth import FastLanguageModel, PatchFastRL
@@ -102,6 +117,18 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     random_state=42,
 )
 
+
+model.answer_start = ANSWER_START
+
+has_thinking_residual = any("thinking_residual" in n for n, _ in model.named_parameters())
+
+thinking_modules_to_save = [
+    "thinking_residual_gate_r",
+    "thinking_residual_gate_i",
+    "thinking_residual_Lambda",
+
+] if has_thinking_residual else None
+
 # Set tokenizer properties (GRPO needs left padding for generation)
 tokenizer.padding_side = "left"
 tokenizer.pad_token = tokenizer.eos_token
@@ -123,6 +150,7 @@ model = FastLanguageModel.get_peft_model(
     # OR all linear layers (not recommended)
     # target_modules = ["all-linear"] #to train all linear layers
     # modules_to_save = ["lm_head","embed_tokens"] # to train embeddings
+    modules_to_save=thinking_modules_to_save,
     lora_alpha=lora_alpha,
     lora_dropout=0,
     bias="none",  # Supports any, but 0 is optimized
@@ -130,6 +158,11 @@ model = FastLanguageModel.get_peft_model(
     random_state=3407,
     use_rslora=True,  # rank stabilized LoRA
 )
+
+if has_thinking_residual and hasattr(model.model.model, "thinking_residual_Lambda"):
+    model.model.model.thinking_residual_Lambda.reset_lambda_parameters(
+        r_min=residual_r_min, r_max=residual_r_max,
+    )
 
 if IS_MAIN_PROCESS:
     print("Model with LoRA applied:")
@@ -332,6 +365,21 @@ trainer = GRPOTrainer(
     processing_class=tokenizer,
     reward_funcs= [get_reward_func(process_gsm8k_answer)],
 )
+
+if has_thinking_residual:
+    try:
+        patch_trainer_optimizer(
+            trainer,
+            lr_thinking_residual_gate=lr_residual_gate,
+            thinking_residual_Lambda=lr_residual_lambda,
+        )
+
+        if IS_MAIN_PROCESS:
+            print("Patched optimizer for thinking residual parameters.")
+
+    except Exception as e:
+        if IS_MAIN_PROCESS:
+            print(f"Warning: failed to patch optimizer for thinking residual params: {e}")
 
 if IS_MAIN_PROCESS:
     print(f"\n{'='*60}")
