@@ -111,7 +111,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     dtype=dtype,
     load_in_4bit=load_in_4bit,
     load_in_8bit=load_in_8bit,
-    device_map={"": LOCAL_RANK} if LOCAL_RANK != -1 else None, #"auto" - doesn't work with multi-GPU training - manually setting a device_map can sometimes conflict with how Accelerate wants to handle the distribution
+    device_map={"": LOCAL_RANK} if LOCAL_RANK != -1 else {"": 0}, #"auto" - doesn't work with multi-GPU training - manually setting a device_map can sometimes conflict with how Accelerate wants to handle the distribution
     use_gradient_checkpointing="unsloth",
     fast_inference=False,  # Set False for training - Enables vLLM fast inference
     random_state=42,

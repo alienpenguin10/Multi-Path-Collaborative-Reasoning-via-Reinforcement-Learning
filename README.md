@@ -82,7 +82,5 @@ Additional eval options:
 ### Push to HuggingFace
 
 ```bash
-python push_to_hf.py \
-    --model_path ./HRPO \
-    --hub_name Alienpenguin10/HRPO
+python push_to_hf.py --model_path ./HRPO --hub_name Alienpenguin10/HRPO
 ```

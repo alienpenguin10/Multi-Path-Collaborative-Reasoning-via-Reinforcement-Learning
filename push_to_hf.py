@@ -1,12 +1,17 @@
-import unsloth
-from unsloth import FastLanguageModel
+import os
+import sys
+
+# Fix shadowing of installed packages by local directories
+sys.path.insert(0, os.path.abspath("unsloth"))
+sys.path.insert(0, os.path.abspath("transformers/src"))
+sys.path.insert(0, os.path.abspath("trl"))
 
 import os
 import glob
 import argparse
 from dotenv import load_dotenv
 from huggingface_hub import login, HfApi
-
+from unsloth import FastLanguageModel
 
 load_dotenv()
 

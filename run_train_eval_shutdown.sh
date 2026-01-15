@@ -4,14 +4,14 @@ set -e
 # ============================================
 # Configuration
 # ============================================
-LAMBDA_INSTANCE_ID="PLACEHOLDER_INSTANCE_ID"  # UPDATE THIS BEFORE RUNNING
+LAMBDA_INSTANCE_ID="ccc40ec766b44644804fbb2403dfaa38"  # UPDATE THIS BEFORE RUNNING
 LAMBDA_API_KEY="${LAMBDA_API_KEY}"  # Set in environment or update here
 
 # Training Configuration
 MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct"
 RUN_NAME="HRPO"
 GROUP_SIZE=8
-PER_DEVICE_TRAIN_BATCH_SIZE=1
+PER_DEVICE_TRAIN_BATCH_SIZE=64
 GRADIENT_ACCUMULATION_STEPS=1
 MAX_PROMPT_LENGTH=1024
 MAX_COMPLETION_LENGTH=1024
@@ -28,7 +28,7 @@ LOCAL_MODEL_PATH="./${RUN_NAME}"
 # Activate virtual environment
 # ============================================
 echo "Activating virtual environment..."
-source ./lamda/bin/activate
+source ./lambda/bin/activate
 
 # ============================================
 # Run Training
