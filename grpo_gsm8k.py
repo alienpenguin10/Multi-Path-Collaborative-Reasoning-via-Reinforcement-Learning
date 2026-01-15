@@ -1,8 +1,7 @@
 import os
 import re
 import torch
-import subprocess
-import string
+import argparse
 from torch.nn.parallel import DistributedDataParallel
 
 # [FIX] Patch DDP class to automatically expose .config from the internal module
@@ -13,6 +12,27 @@ def ddp_config_patch(self):
 DistributedDataParallel.config = ddp_config_patch
 
 
+# Wandb Configuration
+os.environ["WANDB_PROJECT"] = "latent-space-reasoning"
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="GRPO Training on GSM8k")
+parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Model name or path")
+parser.add_argument("--run_name", type=str, default="HRPO", help="Run name for wandb and output directory")
+parser.add_argument("--group_size", type=int, default=8, help="Number of generations per prompt (G in GRPO)")
+parser.add_argument("--per_device_train_batch_size", type=int, default=1, help="Batch size per device")
+parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="Gradient accumulation steps (auto-calculated if not set)")
+parser.add_argument("--max_prompt_length", type=int, default=1024, help="Maximum prompt length")
+parser.add_argument("--max_completion_length", type=int, default=1024, help="Maximum completion length")
+parser.add_argument("--lora_rank", type=int, default=32, help="LoRA rank")
+parser.add_argument("--temperature", type=float, default=0.5, help="Sampling temperature")
+parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
+parser.add_argument("--beta", type=float, default=0.005, help="KL penalty coefficient")
+parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs")
+parser.add_argument("--test_run", action="store_true", help="Run with limited data for testing")
+parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit quantization")
+args = parser.parse_args()
+
 # Distributed Training Setup
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", -1))
@@ -22,52 +42,32 @@ IS_MAIN_PROCESS = RANK in [-1, 0]
 if IS_MAIN_PROCESS:
     print(f"GPUs available: {WORLD_SIZE}")
 
-# os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-# os.environ["UNSLOTH_DISABLE_CACHE"] = "1"
-# os.environ["UNSLOTH_VLLM_STANDBY"] = "1" # [NEW] Extra 30% context lengths!
-# os.environ["UNSLOTH_DISABLE_RL_PATCH"] = "0" # NOTE: We *want* the RL patch for GRPO speedups. Leaving this disabled can cause slower training and, depending on versions, unexpected behavior.
-
-
 if LOCAL_RANK >= 0:
     torch.cuda.set_device(LOCAL_RANK)
 
-if IS_MAIN_PROCESS:
-    logdir = "./logs"
-    tb_port = 6007  # Different port from SFT
-    try:
-        tb_proc = subprocess.Popen(
-            ["tensorboard", f"--logdir={logdir}", f"--port={tb_port}", "--bind_all"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ
-        )
-        print(f"View logs at: http://localhost:{tb_port}")
-        print(f"To stop tensorboard: kill {tb_proc.pid}")
-    except FileNotFoundError:
-        print("Tensorboard not found, skipping...")
-
-
-# Model Configuration
-model_slug = "qwen/Qwen2.5-1.5B-Instruct"  # "qwen/Qwen2.5-3B-Instruct" "qwen/Qwen2.5-7B-Instruct"
-test_run = True  # Set to False for full training
-max_seq_length = 2048  # Shorter for GRPO as it generates responses
+# Model Configuration (from args)
+model_slug = args.model_name
+run_name = args.run_name
+test_run = args.test_run
+max_seq_length = args.max_prompt_length + args.max_completion_length
 dtype = None
-load_in_4bit = False # Because of HRPO; otherwise True
+load_in_4bit = args.load_in_4bit
 load_in_8bit = False
 
-# GRPO Training Hyperparameters
-lora_rank = 32
-lora_alpha = 64  # lora_rank * 2 as in hrpo
-per_device_train_batch_size = 1
-gradient_accumulation_steps = max(1, int(8 / per_device_train_batch_size / WORLD_SIZE))
-num_train_epochs = 1  # GRPO typically needs fewer epochs
-learning_rate = 5e-6  # Lower LR for RL fine-tuning
+# GRPO Training Hyperparameters (from args)
+lora_rank = args.lora_rank
+lora_alpha = lora_rank * 2  # lora_rank * 2 as in hrpo
+per_device_train_batch_size = args.per_device_train_batch_size
+gradient_accumulation_steps = args.gradient_accumulation_steps if args.gradient_accumulation_steps else max(1, int(8 / per_device_train_batch_size / WORLD_SIZE))
+num_train_epochs = args.num_train_epochs
+learning_rate = args.learning_rate
 
-# GRPO specific
-num_generations = 8  # Number of completions to generate per prompt (G in GRPO)
-max_prompt_length = 1024
-max_completion_length = 1024
-beta = 0.005  # KL penalty coefficient
-temperature = 0.5  # Sampling temperature
-
+# GRPO specific (from args)
+num_generations = args.group_size
+max_prompt_length = args.max_prompt_length
+max_completion_length = args.max_completion_length
+beta = args.beta
+temperature = args.temperature
 
 # Dataset Configuration
 ft_dataset_name = "openai/gsm8k"
@@ -187,8 +187,6 @@ if IS_MAIN_PROCESS:
     print(train_dataset[0]["prompt"][:500])
     print(f"\nGround truth answer: {train_dataset[0]['answer']}")
 
-import re
-import string
 # Reward functions
 def extract_from_response(text: str) -> str:
     try:
@@ -255,13 +253,9 @@ def get_reward_func(process_answer_func):
 
 # GRPO Configuration and Trainer
 from trl import GRPOTrainer, GRPOConfig
-from datetime import datetime
 import logging
 
 logging.basicConfig(level=logging.INFO)
-
-current_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_name = f"grpo-{model_slug.split('/')[-1]}-gsm8k-{current_timestamp}"
 
 from unsloth import is_bfloat16_supported
 
@@ -295,7 +289,7 @@ grpo_config = GRPOConfig(
     logging_strategy="steps",
     logging_steps=1,
     logging_dir=f"./logs/{run_name}",
-    report_to="tensorboard",
+    report_to=["wandb"],
     
     # Precision
     bf16=is_bfloat16_supported(),
@@ -418,10 +412,14 @@ if IS_MAIN_PROCESS:
     if True: model.save_pretrained_merged(f"{run_name}", tokenizer, save_method = "merged_16bit",)
     
     # Save locally AND push to hub
-    if False: model.push_to_hub_merged(f"{org}/{run_name}", tokenizer, save_method = "merged_16bit")
+    if False: model.push_to_hub_merged(f"Alienpenguin10/{run_name}", tokenizer, save_method = "merged_16bit")
     
     # Print the run name
     print(run_name)
 
 if __name__ == "__main__":
+    if not os.environ.get("WANDB_API_KEY"):
+         print("Warning: WANDB_API_KEY not found in environment.")
+    if not os.environ.get("HF_TOKEN"):
+         print("Warning: HF_TOKEN not found in environment.")
     print("Training completed successfully!")

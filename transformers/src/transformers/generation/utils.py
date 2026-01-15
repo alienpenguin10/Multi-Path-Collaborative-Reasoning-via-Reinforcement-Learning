@@ -2976,49 +2976,49 @@ class GenerationMixin(ContinuousMixin):
                     print(f"   Stats: min={last_thinking_states.min():.4f}, max={last_thinking_states.max():.4f}")
 
             # NOTE: M3PO Cross-path interaction
-            if enable_cross_path and is_thinking is not None:
-                # DEBUG: Check inputs before cross-path
-                if return_thinking_embeds and len(path_embeddings) >= 1:
-                    probs_has_nan = torch.isnan(probs).any().item()
-                    probs_has_inf = torch.isinf(probs).any().item()
-                    if probs_has_nan or probs_has_inf:
-                        print(f"\n🚨 DEBUG: Invalid probs before cross-path at step {cur_len}")
-                        print(f"   NaN: {probs_has_nan}, Inf: {probs_has_inf}")
-                        print(f"   Probs shape: {probs.shape}, sum: {probs.sum(dim=-1).tolist()[:3]}")
+            # if enable_cross_path and is_thinking is not None:
+            #     # DEBUG: Check inputs before cross-path
+            #     if return_thinking_embeds and len(path_embeddings) >= 1:
+            #         probs_has_nan = torch.isnan(probs).any().item()
+            #         probs_has_inf = torch.isinf(probs).any().item()
+            #         if probs_has_nan or probs_has_inf:
+            #             print(f"\n🚨 DEBUG: Invalid probs before cross-path at step {cur_len}")
+            #             print(f"   NaN: {probs_has_nan}, Inf: {probs_has_inf}")
+            #             print(f"   Probs shape: {probs.shape}, sum: {probs.sum(dim=-1).tolist()[:3]}")
                 
-                # store current path states
-                path_embeddings.append(last_thinking_states.clone())
-                path_distributions.append(probs.clone())
+            #     # store current path states
+            #     path_embeddings.append(last_thinking_states.clone())
+            #     path_distributions.append(probs.clone())
 
-                # Apply cross-path contextual blending
-                if len(path_embeddings) >= 2: # Need at least 2 paths
-                    # DEBUG: Log before cross-path interaction
-                    # if return_thinking_embeds:
-                    #     print(f"\n🔍 DEBUG: Applying cross-path interaction at step {cur_len}")
-                    #     print(f"   Num path embeddings: {len(path_embeddings)}")
-                    #     print(f"   Thinking count: {sum(is_thinking)}/{len(is_thinking)}")
+            #     # Apply cross-path contextual blending
+            #     if len(path_embeddings) >= 2: # Need at least 2 paths
+            #         # DEBUG: Log before cross-path interaction
+            #         # if return_thinking_embeds:
+            #         #     print(f"\n🔍 DEBUG: Applying cross-path interaction at step {cur_len}")
+            #         #     print(f"   Num path embeddings: {len(path_embeddings)}")
+            #         #     print(f"   Thinking count: {sum(is_thinking)}/{len(is_thinking)}")
                     
-                    last_thinking_states_before = last_thinking_states.clone()
-                    last_thinking_states = self.apply_cross_path_interaction_batch(
-                        current_embeds=last_thinking_states,     # [16, hidden_dim]
-                        path_probs=probs,                        # [16, vocab_size]
-                        thinking_mask=is_thinking,               # List of 16 bools
-                        num_generations=num_generations,         # 8
-                        lambda_blend=cross_path_lambda, 
-                        temperature=cross_path_temp)
+            #         last_thinking_states_before = last_thinking_states.clone()
+            #         last_thinking_states = self.apply_cross_path_interaction_batch(
+            #             current_embeds=last_thinking_states,     # [16, hidden_dim]
+            #             path_probs=probs,                        # [16, vocab_size]
+            #             thinking_mask=is_thinking,               # List of 16 bools
+            #             num_generations=num_generations,         # 8
+            #             lambda_blend=cross_path_lambda, 
+            #             temperature=cross_path_temp)
                     
-                    # DEBUG: Check outputs after cross-path
-                    if return_thinking_embeds:
-                        has_nan = torch.isnan(last_thinking_states).any().item()
-                        has_inf = torch.isinf(last_thinking_states).any().item()
-                        changed = not torch.allclose(last_thinking_states_before, last_thinking_states, rtol=1e-4)
-                        #print(f"   After cross-path: NaN={has_nan}, Inf={has_inf}, Changed={changed}")
-                        if has_nan or has_inf:
-                            print(f"   🚨 INVALID OUTPUT FROM CROSS-PATH INTERACTION!")
-                            print(f"   Stats: min={last_thinking_states.min():.4f}, max={last_thinking_states.max():.4f}")
-                            nan_count = torch.isnan(last_thinking_states).sum().item()
-                            inf_count = torch.isinf(last_thinking_states).sum().item()
-                            print(f"   NaN count: {nan_count}, Inf count: {inf_count}")
+            #         # DEBUG: Check outputs after cross-path
+            #         if return_thinking_embeds:
+            #             has_nan = torch.isnan(last_thinking_states).any().item()
+            #             has_inf = torch.isinf(last_thinking_states).any().item()
+            #             changed = not torch.allclose(last_thinking_states_before, last_thinking_states, rtol=1e-4)
+            #             #print(f"   After cross-path: NaN={has_nan}, Inf={has_inf}, Changed={changed}")
+            #             if has_nan or has_inf:
+            #                 print(f"   🚨 INVALID OUTPUT FROM CROSS-PATH INTERACTION!")
+            #                 print(f"   Stats: min={last_thinking_states.min():.4f}, max={last_thinking_states.max():.4f}")
+            #                 nan_count = torch.isnan(last_thinking_states).sum().item()
+            #                 inf_count = torch.isinf(last_thinking_states).sum().item()
+            #                 print(f"   NaN count: {nan_count}, Inf count: {inf_count}")
 
 
             # NOTE: Accumulate Thinking Data
