@@ -57,7 +57,7 @@ def set_random_seed(seed: int = 42):
 set_random_seed(42)
 
 # Set environment variables for Weights & Biases (wandb) logging
-os.environ["WANDB_API_KEY"] = "dea7d241b4217750d3ee58eaec94c6f9349727fb"
+os.environ["WANDB_API_KEY"] = ""
 os.environ["WANDB_PROJECT"] = "latent-space-reasoning"
 
 
@@ -1151,7 +1151,7 @@ if __name__ == "__main__":
     # # Push to Hugging Face Hub
     # print("\nPushing model to Hugging Face Hub...")
     # from huggingface_hub import login
-    # login(token="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")
+    # login(token="")
     # model.push_to_hub("Alienpenguin10/M3PO")
     # tokenizer.push_to_hub("Alienpenguin10/M3PO")
     # print("Model pushed to Hugging Face Hub: Alienpenguin10/M3PO")
