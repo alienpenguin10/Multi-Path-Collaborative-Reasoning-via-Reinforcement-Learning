@@ -24,6 +24,8 @@ import torch
 import torch.distributed as dist
 from packaging import version
 from torch import nn
+#NOTE: M3PO Import for F.softmax
+import torch.nn.functional as F
 
 from ..cache_utils import (
     Cache,
@@ -2205,12 +2207,16 @@ class GenerationMixin(ContinuousMixin):
         synced_gpus,
         assistant_model,
         streamer,
+        processing_class=None, #NOTE: HRPO ADDED
     ) -> dict[str, Any]:
         """
         Extracts and returns the generation mode related keyword arguments from the provided kwargs.
         """
         generation_mode_kwargs = {
             "tokenizer": kwargs.pop("tokenizer", None),
+            #NOTE: HRPO ADDED
+            # Use the passed processing_class, fallback to kwargs only if empty
+            "processing_class": processing_class or kwargs.pop("processing_class", None),
             "assistant_tokenizer": kwargs.pop("assistant_tokenizer", None),
             "assistant_model": assistant_model,
             "streamer": streamer,
@@ -2245,6 +2251,18 @@ class GenerationMixin(ContinuousMixin):
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         use_model_defaults: Optional[bool] = None,
         custom_generate: Optional[Union[str, Callable]] = None,
+        #NOTE: HRPO MOD: Tracks when the model is still thinking before answer_start
+        # Need to compute a latent vector from the token distribution, 
+        # and return the per-step latent embeddings, masks, and mix ratios
+        # So RL can optimize over hybrid trajectories
+        processing_class: Optional["PreTrainedTokenizerBase"] = None,
+        return_thinking_embeds: bool = False, 
+        #NOTE: M3PO MOD: Enable cross-path generation
+        num_generations: int = None,
+        enable_cross_path: bool = None, #NOTE: M3PO Enable 
+        cross_path_lambda: float = None, #NOTE: M3PO blending coefficient
+        cross_path_temp: float = None, #NOTE: M3PO temperature
+        is_inference: bool = False,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -2373,6 +2391,7 @@ class GenerationMixin(ContinuousMixin):
             synced_gpus,
             assistant_model,
             streamer,
+            processing_class=processing_class, #NOTE: HRPO ADDED
         )
 
         generation_config, model_kwargs = self._prepare_generation_config(
@@ -2409,6 +2428,10 @@ class GenerationMixin(ContinuousMixin):
                 **generation_mode_kwargs,
                 **kwargs,
             )
+        # DEBUG
+        # print(f"DEBUG: generate called with kwargs keys: {list(kwargs.keys())}")
+        # if "return_thinking_embeds" in kwargs:
+        #      print(f"DEBUG: generate return_thinking_embeds={kwargs['return_thinking_embeds']}")
 
         # 2. Set generation parameters if not already defined
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
@@ -2567,6 +2590,14 @@ class GenerationMixin(ContinuousMixin):
             logits_processor=prepared_logits_processor,
             stopping_criteria=prepared_stopping_criteria,
             generation_config=generation_config,
+            # NOTE: HRPO MOD to pass thinking args
+            return_thinking_embeds=return_thinking_embeds, #kwargs.get("return_thinking_embeds", False),
+            # NOTE: M3PO MOD to pass cross-path args
+            num_generations=num_generations,
+            enable_cross_path=enable_cross_path,
+            cross_path_lambda=cross_path_lambda,
+            cross_path_temp=cross_path_temp,
+            is_inference=kwargs.get("is_inference", False),
             **generation_mode_kwargs,
             **model_kwargs,
         )
@@ -2691,8 +2722,32 @@ class GenerationMixin(ContinuousMixin):
         generation_config: GenerationConfig,
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
+        # NOTE: HRPO MOD: Explicitly add tokenizer and HRPO flags
+        processing_class: Optional["PreTrainedTokenizerBase"] = None,
+        # NOTE: HRPO MOD: return_thinking_embeds and is_inference
+        return_thinking_embeds: bool = False,
+        is_inference: bool = False,
+        # NOTE: M3PO parameters
+        num_generations: int = None,
+        enable_cross_path: bool = None, #NOTE: M3PO Enable 
+        cross_path_lambda: float = None, #NOTE: M3PO blending coefficient
+        cross_path_temp: float = None, #NOTE: M3PO temperature
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+        # DEBUG: Only print for first batch item
+        # if not hasattr(self, '_debug_sample_count'):
+        #     self._debug_sample_count = 0
+        
+        # debug_this = (self._debug_sample_count == 0 and return_thinking_embeds)
+        # if debug_this:
+        #     print("\n" + "="*80)
+        #     print("🔍 DEBUG: GENERATION WITH HYBRID REASONING")
+        #     print("="*80)
+        #     print(f"return_thinking_embeds={return_thinking_embeds}, is_inference={is_inference}")
+        #     print(f"Input shape: {input_ids.shape}")
+        #     if processing_class:
+        #         print(f"Prompt: {processing_class.decode(input_ids[0][:50])}...")
+        
         r"""
         Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
         can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
@@ -2732,6 +2787,12 @@ class GenerationMixin(ContinuousMixin):
         output_scores = generation_config.output_scores
         output_logits = generation_config.output_logits
         return_dict_in_generate = generation_config.return_dict_in_generate
+        # print("@@"*50)
+        # print(f"DEBUG: Inside modified _sample with return_thinking_embeds={return_thinking_embeds} and enable_cross_path={enable_cross_path}")
+        # if return_thinking_embeds:
+        #     print("DEBUG: Inside modified _sample with return_thinking_embeds=True")
+        #     return_dict_in_generate = False
+        #     print(f"DEBUG: Enforced return_dict_in_generate={return_dict_in_generate}")
         has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
         do_sample = generation_config.do_sample
 
@@ -2751,6 +2812,7 @@ class GenerationMixin(ContinuousMixin):
 
         # keep track of which sequences are already finished
         batch_size, cur_len = input_ids.shape[:2]
+        input_len = cur_len # NOTE: HRPO MOD 
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
@@ -2775,10 +2837,26 @@ class GenerationMixin(ContinuousMixin):
             is_prefill = False
         else:
             is_prefill = True
+        #NOTE:HRPO MOD: Initialize thinking-related variables
+        is_thinking, last_thinking_states = None, None
+        thinking_embeds = [self.get_input_embeddings()(input_ids)] if return_thinking_embeds else []
+        thinking_mask = [torch.zeros_like(input_ids, dtype=torch.bool, device=input_ids.device) ] if return_thinking_embeds else []
+        embeds_ratio = [torch.ones_like(input_ids, dtype=torch.float32, device=input_ids.device)] if return_thinking_embeds else []
+        #NOTE: M3PO MODE: Cross-path interaction state
+        # Shape: (batch_size, hidden_dim) for each of N paths
+        path_embeddings = [] # Store current embeddings for all paths
+        path_distributions = [] # Store probability distributions for gating
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            # prepare variable output controls (note: some models won't accept all output controls)
+            model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
+            model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+
+            #NOTE: HRPO MOD: Adding thinking-related variables to model inputs
+            model_inputs.update({"is_thinking": is_thinking} if is_thinking is not None else {})
+            model_inputs.update({"last_thinking_states": last_thinking_states} if last_thinking_states is not None else {})
 
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True)
@@ -2821,7 +2899,8 @@ class GenerationMixin(ContinuousMixin):
                         if self.config.is_encoder_decoder
                         else (outputs.hidden_states,)
                     )
-
+            # NOTE: HRPO MOD: ALWAYS calculate probs for HRPO embedding logic
+            
             # token selection
             if do_sample:
                 probs = nn.functional.softmax(next_token_scores, dim=-1)
@@ -2829,6 +2908,25 @@ class GenerationMixin(ContinuousMixin):
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
+            
+            # DEBUG: Validate token IDs immediately after sampling
+            if return_thinking_embeds:
+                vocab_size = self.get_input_embeddings().weight.shape[0]
+                invalid_mask = (next_tokens < 0) | (next_tokens >= vocab_size)
+                if invalid_mask.any():
+                    invalid_count = invalid_mask.sum().item()
+                    invalid_token_ids = next_tokens[invalid_mask].tolist()
+                    print(f"\n🚨 DEBUG: Invalid tokens sampled at step {cur_len}!")
+                    print(f"   Invalid count: {invalid_count}/{next_tokens.shape[0]}")
+                    print(f"   Invalid token IDs: {invalid_token_ids[:10]}")
+                    print(f"   Valid range: [0, {vocab_size})")
+                    print(f"   Logits stats: min={next_token_logits.min():.4f}, max={next_token_logits.max():.4f}")
+                    print(f"   Scores stats: min={next_token_scores.min():.4f}, max={next_token_scores.max():.4f}")
+                    has_nan = torch.isnan(next_token_scores).any().item()
+                    has_inf = torch.isinf(next_token_scores).any().item()
+                    print(f"   Scores NaN: {has_nan}, Inf: {has_inf}")
+
+                    
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -2838,6 +2936,113 @@ class GenerationMixin(ContinuousMixin):
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
+            
+            # NOTE: HRPO Calculate Thinking Logic
+            # determine if the model is still "thinking" (based on whether it has output an answer start token)
+            # calculate the next thinking state. Note: You'll need to know what self.answer_start is. 
+            # In the HRPO codebase, this seems to be a specific string/token that denotes the end of thinking.
+            # You might need to add this property or pass it in.
+
+            # DEBUG: Check token IDs before decoding
+            if return_thinking_embeds and cur_len >= input_len:
+                token_slice = input_ids[:, input_len:]
+                vocab_size = self.get_input_embeddings().weight.shape[0]
+                invalid_mask = (token_slice < 0) | (token_slice >= vocab_size)
+                if invalid_mask.any():
+                    invalid_count = invalid_mask.sum().item()
+                    invalid_ids = token_slice[invalid_mask].unique().tolist()
+                    print(f"\n🚨 DEBUG: Found {invalid_count} invalid token IDs before decode at step {cur_len}")
+                    print(f"   Invalid IDs: {invalid_ids[:10]} (showing first 10)")
+                    print(f"   Valid range: [0, {vocab_size})")
+                    print(f"   Token slice shape: {token_slice.shape}")
+
+            # Decode only the generated part to look for the delimiter
+            strs = processing_class.batch_decode(input_ids[:, input_len:])
+            # Check if the answer start delimiter (e.g., '####') is present
+            # self.answer_start should be set to "####" as per the paper
+            is_thinking = [self.answer_start not in s for s in strs]
+            # Calculate weighted average of embeddings based on probs
+            # last_thinking_states = W_e^T * p_t / ||p_t||
+            last_thinking_states = torch.einsum('bv,vd->bd', probs, self.get_input_embeddings().weight)
+            # Normalize
+            last_thinking_states /= torch.sqrt((probs ** 2).sum(-1, keepdim=True)).to(last_thinking_states.dtype)
+            
+            # DEBUG: Check last_thinking_states after computation
+            if return_thinking_embeds:
+                has_nan = torch.isnan(last_thinking_states).any().item()
+                has_inf = torch.isinf(last_thinking_states).any().item()
+                if has_nan or has_inf:
+                    print(f"\n🚨 DEBUG: Invalid last_thinking_states at step {cur_len}")
+                    print(f"   NaN: {has_nan}, Inf: {has_inf}")
+                    print(f"   Shape: {last_thinking_states.shape}")
+                    print(f"   Stats: min={last_thinking_states.min():.4f}, max={last_thinking_states.max():.4f}")
+
+            # NOTE: M3PO Cross-path interaction
+            # if enable_cross_path and is_thinking is not None:
+            #     # DEBUG: Check inputs before cross-path
+            #     if return_thinking_embeds and len(path_embeddings) >= 1:
+            #         probs_has_nan = torch.isnan(probs).any().item()
+            #         probs_has_inf = torch.isinf(probs).any().item()
+            #         if probs_has_nan or probs_has_inf:
+            #             print(f"\n🚨 DEBUG: Invalid probs before cross-path at step {cur_len}")
+            #             print(f"   NaN: {probs_has_nan}, Inf: {probs_has_inf}")
+            #             print(f"   Probs shape: {probs.shape}, sum: {probs.sum(dim=-1).tolist()[:3]}")
+                
+            #     # store current path states
+            #     path_embeddings.append(last_thinking_states.clone())
+            #     path_distributions.append(probs.clone())
+
+            #     # Apply cross-path contextual blending
+            #     if len(path_embeddings) >= 2: # Need at least 2 paths
+            #         # DEBUG: Log before cross-path interaction
+            #         # if return_thinking_embeds:
+            #         #     print(f"\n🔍 DEBUG: Applying cross-path interaction at step {cur_len}")
+            #         #     print(f"   Num path embeddings: {len(path_embeddings)}")
+            #         #     print(f"   Thinking count: {sum(is_thinking)}/{len(is_thinking)}")
+                    
+            #         last_thinking_states_before = last_thinking_states.clone()
+            #         last_thinking_states = self.apply_cross_path_interaction_batch(
+            #             current_embeds=last_thinking_states,     # [16, hidden_dim]
+            #             path_probs=probs,                        # [16, vocab_size]
+            #             thinking_mask=is_thinking,               # List of 16 bools
+            #             num_generations=num_generations,         # 8
+            #             lambda_blend=cross_path_lambda, 
+            #             temperature=cross_path_temp)
+                    
+            #         # DEBUG: Check outputs after cross-path
+            #         if return_thinking_embeds:
+            #             has_nan = torch.isnan(last_thinking_states).any().item()
+            #             has_inf = torch.isinf(last_thinking_states).any().item()
+            #             changed = not torch.allclose(last_thinking_states_before, last_thinking_states, rtol=1e-4)
+            #             #print(f"   After cross-path: NaN={has_nan}, Inf={has_inf}, Changed={changed}")
+            #             if has_nan or has_inf:
+            #                 print(f"   🚨 INVALID OUTPUT FROM CROSS-PATH INTERACTION!")
+            #                 print(f"   Stats: min={last_thinking_states.min():.4f}, max={last_thinking_states.max():.4f}")
+            #                 nan_count = torch.isnan(last_thinking_states).sum().item()
+            #                 inf_count = torch.isinf(last_thinking_states).sum().item()
+            #                 print(f"   NaN count: {nan_count}, Inf count: {inf_count}")
+
+
+            # NOTE: Accumulate Thinking Data
+            # If return_thinking_embeds is True, append the hidden states (which HRPO seems to be hijacking to return extra info) to your lists.
+            # The model returns [] on first iteration when is_thinking is None, and [thinking_embeds, is_thinking, embeds_ratio] on subsequent iterations
+            if return_thinking_embeds and outputs.hidden_states is not None and len(outputs.hidden_states) == 3:
+                # expect the model to return a tuple (thinking_embeds, thinking_mask, embeds_ratio) packed into outputs.hidden_states
+                thinking_embeds.append(outputs.hidden_states[0].unsqueeze(1))
+                thinking_mask.append(torch.tensor(outputs.hidden_states[1], device=input_ids.device).unsqueeze(1))
+                embeds_ratio.append(torch.tensor(outputs.hidden_states[2], device=input_ids.device).unsqueeze(1))
+                
+                # DEBUG: Print for first example
+                # if debug_this and cur_len <= input_len + 20:
+                #     # Note: batch_size = num_generations (8), so we have 8 parallel completions
+                #     for completion in range(batch_size):
+                #         print(f"\nCompletion from _sample 🍴 generation utils.py {completion} of {batch_size}:")
+                #         ratio_val = outputs.hidden_states[2][completion].item()  # Take first batch element
+                #         is_think = outputs.hidden_states[1][completion] if isinstance(outputs.hidden_states[1], list) and len(outputs.hidden_states[1]) > 0 else outputs.hidden_states[1]
+                #         token_text = processing_class.decode([next_tokens[completion].item()])
+                #         print(f"\n  Step {cur_len - input_len}: Token '{token_text}' | "
+                #               f"Thinking={is_think} | Embeds_ratio={ratio_val:.3f} | "
+                #           f"Hidden_ratio={torch.sqrt(torch.tensor(1-ratio_val**2)).item():.3f}")
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
@@ -2873,7 +3078,176 @@ class GenerationMixin(ContinuousMixin):
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            # NOTE: Return Thinking Data
+            # At the end of the method, if return_thinking_embeds is True, return the accumulated tensors.
+            if return_thinking_embeds:
+                # Append final state for the last token
+                thinking_embeds.append(self.get_input_embeddings()(input_ids[:, -1:]))
+                # Append mask for the last token
+                thinking_mask.append(torch.zeros_like(input_ids[:, -1:], dtype=torch.bool, device=input_ids.device))
+                # Append ratio for the last token
+                embeds_ratio.append(torch.ones_like(input_ids[:, -1:], dtype=torch.float32, device=input_ids.device))
+                return input_ids, torch.cat(thinking_embeds, dim=1), torch.cat(thinking_mask, dim=1), torch.cat(embeds_ratio, dim=1)
+            else:
+                return input_ids
+
+    # NOTE: M3PO MOD: Cross-path interaction
+    def apply_cross_path_interaction_batch(
+        self, 
+        current_embeds: torch.Tensor, # (batch_size * N, hidden_dim) 
+        path_probs: torch.Tensor, # (batch_size * N, vocab_size)
+        thinking_mask: list, # Length: batch_size * N
+        num_generations: int, # N
+        lambda_blend: float = 0.1,
+        temperature: float = 0.1,
+    ) -> torch.Tensor:
+        # current_embeds: If you extract from outputs.hidden_states[-1][:, -1, :] → [16, hidden_dim] = [16, 1536] (for 1.5B model)
+        # path_probs: [16, vocab_size]
+        # so we can reshape to group by prompt
+        # current_embeds_grouped = current_embeds.view(batch, N, hidden)
+        # paths_probs_grouped = path_probs.view(batch, N, vocab_size)
+
+        batch_size = current_embeds.shape[0] // num_generations
+        hidden_dim = current_embeds.shape[1]
+
+        # Reshape to separate batches and paths
+        # (batch_size * N, hidden_dim) -> (batch_size, N, hidden_dim)
+        embeds = current_embeds.view(batch_size, num_generations, hidden_dim) # [batch, N, vocab]
+        probs = path_probs.view(batch_size, num_generations, -1)  # [batch, N, vocab]
+
+        # Process each batch independently
+        blended_list = []
+        for b in range(batch_size):
+            batch_embeds = embeds[b] # (N, hidden_dim)
+            batch_probs = probs[b] # (N, vocab_size)
+            batch_thinking = thinking_mask[b * num_generations : (b + 1) * num_generations]
+            blended = self.apply_cross_path_interaction(
+                current_embeds=batch_embeds, 
+                path_embeds_history=[batch_embeds], 
+                path_probs_history=[batch_probs], 
+                is_thinking=batch_thinking, 
+                lambda_blend=lambda_blend, 
+                temperature=temperature)
+            blended_list.append(blended)
+        # Reshape back to (batch_size * N, hidden_dim)
+        return torch.cat(blended_list, dim=0)
+    
+    def apply_cross_path_interaction(
+        self,
+        current_embeds: torch.Tensor, # (N, hidden_dim)
+        path_embeds_history: list, # List of (N, hidden_dim)
+        path_probs_history: list, # List of (N, vocab_size)
+        is_thinking: list, # List of bool
+        lambda_blend: float,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        Apply cross-path interaction to the current embeds.
+
+        Returns: Blended embeddings: (N, hidden_dim)
+        """
+        N = current_embeds.shape[0] # Number of paths
+        hidden_dim = current_embeds.shape[1] # Hidden dimension
+        device = current_embeds.device
+
+        # Get current step's probability distributions (last in history)
+        current_probs = path_probs_history[-1] # (N, vocab_size)
+        
+        # DEBUG: Check inputs
+        debug_enabled = hasattr(self, 'answer_start')  # Only debug when HRPO is active
+        if debug_enabled:
+            has_nan_embeds = torch.isnan(current_embeds).any().item()
+            has_inf_embeds = torch.isinf(current_embeds).any().item()
+            has_nan_probs = torch.isnan(current_probs).any().item()
+            has_inf_probs = torch.isinf(current_probs).any().item()
+            if has_nan_embeds or has_inf_embeds or has_nan_probs or has_inf_probs:
+                print(f"      🚨 DEBUG [apply_cross_path]: Invalid inputs!")
+                print(f"         Embeds: NaN={has_nan_embeds}, Inf={has_inf_embeds}")
+                print(f"         Probs: NaN={has_nan_probs}, Inf={has_inf_probs}")
+
+        # Compute pairwise cosine similarity between distributions
+        # A_ij = cosine_similarity(p_i, p_j)
+        normalised_probs = current_probs / (current_probs.norm(dim=1, keepdim=True) + 1e-8)
+        similarity_matrix = torch.mm(normalised_probs, normalised_probs.t()) # (N, N)
+        
+        # DEBUG: Check similarity matrix
+        if debug_enabled:
+            has_nan = torch.isnan(similarity_matrix).any().item()
+            has_inf = torch.isinf(similarity_matrix).any().item()
+            if has_nan or has_inf:
+                print(f"      🚨 DEBUG [apply_cross_path]: Invalid similarity_matrix!")
+                print(f"         NaN={has_nan}, Inf={has_inf}")
+                print(f"         Stats: min={similarity_matrix.min():.4f}, max={similarity_matrix.max():.4f}")
+
+        # Mask diagonal (no self-interaction)
+        mask = torch.eye(N, dtype=torch.bool, device=device)
+        similarity_matrix.masked_fill_(mask, float('-inf'))
+        
+        # Mask inactive paths (those that exited thinking mode)
+        thinking_mask = torch.tensor(is_thinking, device=device, dtype=torch.bool)
+        # If path i is not thinking, it shouldn't controbute or receive
+        active_mask = thinking_mask.unsqueeze(0) & thinking_mask.unsqueeze(1) #(N, N)
+        active_mask = active_mask & ~mask # Exclude diagonal
+        similarity_matrix = similarity_matrix.masked_fill(~active_mask, float('-inf'))
+
+        # Temperature-scaled softmax to get attention weights
+        # SAFETY: Handle rows where all values are -inf (no valid attention targets)
+        # softmax([-inf, -inf, ...]) produces NaN, so we replace such rows with zeros
+        scaled_similarity = similarity_matrix / temperature
+        all_inf_mask = (similarity_matrix == float('-inf')).all(dim=1)  # (N,) bool mask
+        
+        # Compute softmax
+        attention_weights = F.softmax(scaled_similarity, dim=1) #(N,N)
+        
+        # Replace NaN rows (from all -inf) with zeros (no attention)
+        if all_inf_mask.any():
+            attention_weights[all_inf_mask] = 0.0
+        
+        # DEBUG: Check attention weights
+        if debug_enabled:
+            has_nan = torch.isnan(attention_weights).any().item()
+            has_inf = torch.isinf(attention_weights).any().item()
+            if has_nan or has_inf:
+                print(f"      🚨 DEBUG [apply_cross_path]: Invalid attention_weights!")
+                print(f"         NaN={has_nan}, Inf={has_inf}")
+                print(f"         Temperature: {temperature}")
+                print(f"         Scaled similarity stats: min={scaled_similarity.min():.4f}, max={scaled_similarity.max():.4f}")
+                # Count how many rows are all -inf
+                all_inf_rows = all_inf_mask.sum().item()
+                print(f"         All -inf rows: {all_inf_rows}/{N}")
+                print(f"         Fixed by zeroing: {all_inf_rows} rows")
+        
+        # Compute contextual embeddings: c_i = Σ_j A_ij * e_j
+        contextual_embeds = torch.mm(attention_weights, current_embeds) #(N, hidden_dim)
+        
+        # DEBUG: Check contextual embeddings
+        if debug_enabled:
+            has_nan = torch.isnan(contextual_embeds).any().item()
+            has_inf = torch.isinf(contextual_embeds).any().item()
+            if has_nan or has_inf:
+                print(f"      🚨 DEBUG [apply_cross_path]: Invalid contextual_embeds!")
+                print(f"         NaN={has_nan}, Inf={has_inf}")
+                print(f"         Stats: min={contextual_embeds.min():.4f}, max={contextual_embeds.max():.4f}")
+
+        # Blend: h_i = (1 - λ) * e_i + λ * c_i
+        blended_embeds = (1 - lambda_blend) * current_embeds + lambda_blend * contextual_embeds
+
+        # Only apply blending to paths that are still in thinking mode
+        # Keep original for non-thinking paths
+        result = torch.where(thinking_mask.unsqueeze(1), blended_embeds, current_embeds)
+        
+        # DEBUG: Check final result
+        if debug_enabled:
+            has_nan = torch.isnan(result).any().item()
+            has_inf = torch.isinf(result).any().item()
+            if has_nan or has_inf:
+                print(f"      🚨 DEBUG [apply_cross_path]: Invalid FINAL result!")
+                print(f"         NaN={has_nan}, Inf={has_inf}")
+                nan_count = torch.isnan(result).sum().item()
+                inf_count = torch.isinf(result).sum().item()
+                print(f"         NaN count: {nan_count}/{result.numel()}, Inf count: {inf_count}/{result.numel()}")
+
+        return result
 
     @staticmethod
     def _flatten_beam_dim(tensor: torch.Tensor) -> torch.Tensor:
@@ -3543,6 +3917,7 @@ class GenerationMixin(ContinuousMixin):
 
         # keep track of which sequences are already finished
         batch_size, cur_len = input_ids.shape[:2]
+        input_len = cur_len # NOTE: HRPO MOD 
         if batch_size > 1:
             raise ValueError("assisted generate is only supported for batch_size = 1")
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
@@ -3861,3 +4236,4 @@ def _split_model_outputs(outputs, new_outputs, cur_len, added_len, is_decoder_at
             new_tuple += (layer[..., i : i + 1, :last_dim_size],)
         outputs += (new_tuple,)
     return outputs
+
