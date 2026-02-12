@@ -41,6 +41,7 @@ def compute_cross_path_attention(
     output_distributions: torch.Tensor,  # (N, vocab_size) - probability distributions
     thinking_mask: List[bool],           # Which paths are still in thinking mode
     temperature: float = 0.1,
+    gating_function=None,                # Optional: Alternative gating function (BaseM3POGating)
 ) -> torch.Tensor:
     """
     Compute cross-path attention weights from output probability distributions.
@@ -54,6 +55,7 @@ def compute_cross_path_attention(
         output_distributions: Softmax probabilities for each path (N, vocab_size)
         thinking_mask: Boolean mask, True = path is still in thinking mode
         temperature: Temperature for softmax (lower = sharper attention)
+        gating_function: Optional BaseM3POGating instance for alternative similarity computation
 
     Returns:
         attention_weights: (N, N) attention matrix for cross-path blending
@@ -63,43 +65,57 @@ def compute_cross_path_attention(
     N = output_distributions.shape[0]
     device = output_distributions.device
 
-    # Equation 3: Compute pairwise cosine similarity from OUTPUT DISTRIBUTIONS
-    # Normalize distributions
-    norm_dists = output_distributions / (output_distributions.norm(dim=1, keepdim=True) + 1e-8)
-
-    # Similarity matrix: S_ij = (p_i · p_j) / (||p_i|| ||p_j||)
-    similarity_matrix = torch.mm(norm_dists, norm_dists.t())  # (N, N)
-
-    # Equation 4: Mask diagonal (no self-reinforcement)
-    diag_mask = torch.eye(N, dtype=torch.bool, device=device)
-    similarity_matrix = similarity_matrix.masked_fill(diag_mask, float('-inf'))
-
-    # Mask inactive paths (those that exited thinking mode)
+    # Convert thinking_mask to tensor
     thinking_tensor = torch.tensor(thinking_mask, device=device, dtype=torch.bool)
 
-    # Path i shouldn't receive from inactive paths, inactive paths shouldn't contribute
-    active_mask = thinking_tensor.unsqueeze(0) & thinking_tensor.unsqueeze(1)
-    active_mask = active_mask & ~diag_mask  # Also exclude diagonal
-    similarity_matrix = similarity_matrix.masked_fill(~active_mask, float('-inf'))
+    # Compute attention weights
+    if gating_function is not None:
+        # Use alternative gating function (computes similarity + attention in one call)
+        similarity_matrix = gating_function.compute_similarity_matrix(
+            output_distributions=output_distributions,
+            hidden_states=None,
+        )
+        attention_weights, _ = gating_function.compute_attention_weights(
+            similarity_matrix=similarity_matrix,
+            thinking_mask=thinking_tensor,
+            mask_diagonal=True,
+        )
+    else:
+        # Baseline: Equation 3 - Compute pairwise cosine similarity from OUTPUT DISTRIBUTIONS
+        # Normalize distributions
+        norm_dists = output_distributions / (output_distributions.norm(dim=1, keepdim=True) + 1e-8)
 
-    # Equation 5: Temperature-scaled softmax for attention weights
-    scaled_sim = similarity_matrix / temperature
+        # Similarity matrix: S_ij = (p_i · p_j) / (||p_i|| ||p_j||)
+        similarity_matrix = torch.mm(norm_dists, norm_dists.t())  # (N, N)
 
-    # Handle rows where all values are -inf (no valid attention targets)
-    all_inf_mask = (similarity_matrix == float('-inf')).all(dim=1)
+        # Equation 4: Mask diagonal (no self-reinforcement)
+        diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+        similarity_matrix = similarity_matrix.masked_fill(diag_mask, float('-inf'))
 
-    attention_weights = F.softmax(scaled_sim, dim=1)  # (N, N)
+        # Mask inactive paths (those that exited thinking mode)
+        # Path i shouldn't receive from inactive paths, inactive paths shouldn't contribute
+        active_mask = thinking_tensor.unsqueeze(0) & thinking_tensor.unsqueeze(1)
+        active_mask = active_mask & ~diag_mask  # Also exclude diagonal
+        similarity_matrix = similarity_matrix.masked_fill(~active_mask, float('-inf'))
 
-    # Replace NaN rows (from all -inf) with zeros
-    if all_inf_mask.any():
-        attention_weights[all_inf_mask] = 0.0
+        # Equation 5: Temperature-scaled softmax for attention weights
+        scaled_sim = similarity_matrix / temperature
 
-    if debug:
-        active_count = thinking_tensor.sum().item()
-        print(f"[M3PO] Computing attention: {active_count}/{N} active paths, temp={temperature}")
-        if N <= 8:
-            print(f"[M3PO] Similarity matrix:\n{similarity_matrix}")
-            print(f"[M3PO] Attention weights:\n{attention_weights}")
+        # Handle rows where all values are -inf (no valid attention targets)
+        all_inf_mask = (similarity_matrix == float('-inf')).all(dim=1)
+
+        attention_weights = F.softmax(scaled_sim, dim=1)  # (N, N)
+
+        # Replace NaN rows (from all -inf) with zeros
+        if all_inf_mask.any():
+            attention_weights[all_inf_mask] = 0.0
+
+        if debug:
+            active_count = thinking_tensor.sum().item()
+            print(f"[M3PO] Computing attention: {active_count}/{N} active paths, temp={temperature}")
+            if N <= 8:
+                print(f"[M3PO] Similarity matrix:\n{similarity_matrix}")
+                print(f"[M3PO] Attention weights:\n{attention_weights}")
 
     return attention_weights
 
@@ -154,6 +170,7 @@ def apply_m3po_step(
     sampled_tokens: torch.Tensor,        # (batch_size * N,) - sampled token IDs
     config: M3POConfig,
     thinking_mask: Optional[List[bool]] = None,
+    gating_function=None,                # Optional: Alternative gating function (BaseM3POGating)
 ) -> torch.Tensor:
     """
     Apply one step of M3PO cross-path interaction.
@@ -213,6 +230,7 @@ def apply_m3po_step(
             output_distributions=batch_dists,
             thinking_mask=batch_thinking,
             temperature=config.temperature,
+            gating_function=gating_function,
         )
 
         # Blend token embeddings
@@ -245,6 +263,7 @@ def generate_with_m3po(
     pad_token_id: Optional[int] = None,
     eos_token_id: Optional[int] = None,
     thinking_end_tokens: Optional[List[int]] = None,
+    gating_function=None,                # Optional: Alternative gating function (BaseM3POGating)
 ) -> torch.Tensor:
     """
     Generate with M3PO - cleaner implementation.
@@ -327,6 +346,7 @@ def generate_with_m3po(
                 sampled_tokens=next_tokens,
                 config=config,
                 thinking_mask=thinking_mask,
+                gating_function=gating_function,
             )
             # Shape: (total_paths, 1, hidden_dim)
         else:

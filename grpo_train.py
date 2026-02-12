@@ -219,7 +219,7 @@ def create_completion_mask(completion_ids, eos_token_id):
     return (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
 def generate_completions(model, tokenizer, prompts, num_generations=4, max_completion_length=32,
-                         lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True):
+                         lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True, gating_function=None):
     """
     Generates multiple completions for each prompt with optional M3PO cross-path interaction.
 
@@ -281,6 +281,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             thinking_end_tokens=thinking_end_tokens if thinking_end_tokens else None,
+            gating_function=gating_function,
         )
 
         # print("[M3PO] Generation complete")
@@ -311,7 +312,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
     return prompt_ids, prompt_mask, completion_ids, completion_mask
 
 def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_generations, max_completion_length,
-                          lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True):
+                          lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True, gating_function=None):
     """
     Generates data for GRPO rollouts including completions and log probabilities.
 
@@ -344,7 +345,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
     with torch.no_grad():
         prompt_ids, prompt_mask, completion_ids, completion_mask = generate_completions(
             model, tokenizer, prompts, num_generations, max_completion_length,
-            lambda_blend=lambda_blend, temperature_m3po=temperature_m3po, use_m3po=use_m3po
+            lambda_blend=lambda_blend, temperature_m3po=temperature_m3po, use_m3po=use_m3po,
+            gating_function=gating_function
         )
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -488,7 +490,8 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
 def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=500, batch_size=4,
                               num_generations=4, max_completion_length=128, beta=0.1,
                               learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None, device_ids=None,
-                              lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True):
+                              lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True,
+                              gating_type='baseline', gating_config=None):
     """
     Train with GRPO + M3PO (Multi-Path Perception Policy Optimization).
 
@@ -533,8 +536,26 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # if use_m3po:
-    #     print(f"[M3PO] Training with cross-path interaction: lambda={lambda_blend}, temp={temperature_m3po}")
+    if use_m3po:
+        print(f"[M3PO] Training with cross-path interaction: lambda={lambda_blend}, temp={temperature_m3po}")
+
+    # Create gating function if specified
+    gating_function = None
+    if use_m3po and gating_type != 'baseline':
+        from transformers.models.qwen2.m3po_gating import create_gating_function
+        gating_config = gating_config or {}
+        # Use temperature_m3po if not specified in gating_config
+        if 'temperature' not in gating_config:
+            gating_config['temperature'] = temperature_m3po
+        try:
+            gating_function = create_gating_function(gating_type, gating_config)
+            print(f"[M3PO] Using {gating_type} gating function with config: {gating_config}")
+            if gating_function and gating_function.has_learnable_parameters:
+                print(f"[M3PO] Warning: Learnable gating parameters detected. Gradient flow will be enabled during loss computation.")
+        except ValueError as e:
+            print(f"[M3PO] Error creating gating function: {e}")
+            print(f"[M3PO] Falling back to baseline (cosine similarity)")
+            gating_function = None
 
     # Wrap model with DataParallel if multiple GPUs are available.
 
@@ -575,7 +596,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     max_completion_length,
                     lambda_blend=lambda_blend,
                     temperature_m3po=temperature_m3po,
-                    use_m3po=use_m3po
+                    use_m3po=use_m3po,
+                    gating_function=gating_function
                 )
             for grpo_iter in range(mu):
                 # Enable verbose output on first step to show detailed breakdown
@@ -712,6 +734,12 @@ if __name__ == "__main__":
         'lambda_blend': 0.1,               # Blending coefficient λ
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
+        # Gating function selection (for research on alternative gating mechanisms)
+        'gating_type': 'baseline',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
+        'gating_config': {                 # Configuration for gating function
+            'temperature': 0.1,            # Will override temperature_m3po if gating is used
+            'debug': False,                # Enable debug logging
+        },
     }
 
     # Initialize Weights & Biases

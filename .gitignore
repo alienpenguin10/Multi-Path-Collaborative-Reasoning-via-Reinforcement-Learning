@@ -12,4 +12,6 @@ wandb/
 .env
 trained_models/
 Reports/
+.claude/
 CLAUDE.md
+.DS_Store
