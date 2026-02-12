@@ -12,3 +12,4 @@ wandb/
 .env
 trained_models/
 Reports/
+CLAUDE.md
