@@ -148,7 +148,7 @@ def blend_token_embeddings(
     device = token_embeddings.device
 
     # Equation 6: Compute contextual embeddings c_i = Σ_j A_ij * e_j
-    contextual_embeddings = torch.mm(attention_weights, token_embeddings)  # (N, hidden_dim)
+    contextual_embeddings = torch.mm(attention_weights.to(token_embeddings.dtype), token_embeddings)  # (N, hidden_dim)
 
     # Equation 2: Blend h̄_i = (1 - λ) * e_i + λ * c_i
     blended = (1 - lambda_blend) * token_embeddings + lambda_blend * contextual_embeddings
@@ -248,6 +248,123 @@ def apply_m3po_step(
 
     # Add sequence dimension for transformer input: (batch_size * N, 1, hidden_dim)
     return result.unsqueeze(1)
+
+
+def apply_m3po_to_logits(
+    logits: torch.Tensor,          # (N, seq_len, vocab_size) — one question group
+    num_generations: int,          # N paths
+    lambda_blend: float = 0.1,
+    temperature: float = 0.1,
+    gating_function=None,          # Optional BaseM3POGating
+    completion_mask=None,          # Optional (N, seq_len) binary mask
+) -> torch.Tensor:
+    """
+    Apply M3PO cross-path logit blending for a single question group during loss computation.
+
+    This creates a differentiable path from loss → log_probs → blended_logits → attention_weights
+    → similarity_matrix → gating_parameters, enabling gradient flow to learnable gating params.
+
+    Blending formula (per position t):
+        1. p_i = softmax(logits_i[t])                     # output distributions
+        2. S_ij = gating_fn.compute_similarity_matrix(p)   # differentiable similarity
+        3. A_ij = softmax(S_ij / T)                        # attention weights
+        4. blended_i[t] = (1-λ)*logits_i[t] + λ*Σ_j A_ij*logits_j[t]  # logit blending
+
+    Args:
+        logits: Raw logits from model (N, seq_len, vocab_size) for one question group
+        num_generations: Number of paths N (should equal logits.shape[0])
+        lambda_blend: Blending coefficient (0 = no blend, 1 = full contextual)
+        temperature: Temperature for attention softmax
+        gating_function: Optional BaseM3POGating instance for custom similarity computation
+        completion_mask: Optional (N, seq_len) binary mask, 1 for valid positions
+
+    Returns:
+        blended_logits: (N, seq_len, vocab_size) with cross-path blending applied
+    """
+    debug = os.environ.get('M3PO_DEBUG', '0') == '1'
+
+    N, seq_len, vocab_size = logits.shape
+    device = logits.device
+
+    if N != num_generations:
+        raise ValueError(f"[M3PO] logits batch dim {N} != num_generations {num_generations}")
+
+    if gating_function is not None:
+        # Custom gating: loop over positions (gating API expects (N, vocab_size) per position)
+        blended = logits.clone()
+        thinking_mask = torch.ones(N, dtype=torch.bool, device=device)
+
+        for t in range(seq_len):
+            # Skip masked positions if mask provided
+            if completion_mask is not None and completion_mask[:, t].sum() == 0:
+                continue
+
+            # 1. Output distributions for similarity computation
+            p = F.softmax(logits[:, t, :], dim=-1)  # (N, vocab_size)
+
+            # 2. Compute similarity matrix via gating function (differentiable)
+            similarity_matrix = gating_function.compute_similarity_matrix(
+                output_distributions=p,
+                hidden_states=None,
+            )
+
+            # 3. Compute attention weights (differentiable)
+            attention_weights, _ = gating_function.compute_attention_weights(
+                similarity_matrix=similarity_matrix,
+                thinking_mask=thinking_mask,
+                mask_diagonal=True,
+            )
+
+            # 4. Blend logits: blended_i[t] = (1-λ)*logits_i[t] + λ*Σ_j A_ij*logits_j[t]
+            contextual = torch.mm(
+                attention_weights.to(logits.dtype),
+                logits[:, t, :]
+            )  # (N, vocab_size)
+            blended[:, t, :] = (1 - lambda_blend) * logits[:, t, :] + lambda_blend * contextual
+
+        if debug:
+            diff = (blended - logits).abs().mean().item()
+            print(f"[M3PO LOGITS] Custom gating, N={N}, seq_len={seq_len}, mean_change={diff:.6f}")
+
+        return blended
+
+    else:
+        # Baseline cosine similarity: vectorize across positions using torch.bmm
+        # Reshape to (seq_len, N, vocab_size) for batched computation
+        logits_t = logits.permute(1, 0, 2)  # (seq_len, N, vocab_size)
+
+        # 1. Output distributions
+        p_t = F.softmax(logits_t, dim=-1)  # (seq_len, N, vocab_size)
+
+        # 2. Cosine similarity: normalize then batched matmul
+        norm_p = p_t / (p_t.norm(dim=-1, keepdim=True) + 1e-8)  # (seq_len, N, vocab_size)
+        sim = torch.bmm(norm_p, norm_p.transpose(1, 2))  # (seq_len, N, N)
+
+        # 3. Mask diagonal and apply temperature-scaled softmax
+        diag_mask = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)  # (1, N, N)
+        sim = sim.masked_fill(diag_mask, float('-inf'))
+        scaled_sim = sim / temperature
+        attention = F.softmax(scaled_sim, dim=-1)  # (seq_len, N, N)
+
+        # Handle all-inf rows (single path case)
+        all_inf = (sim == float('-inf')).all(dim=-1, keepdim=True)  # (seq_len, N, 1)
+        attention = attention.masked_fill(all_inf, 0.0)
+
+        # 4. Blend logits
+        contextual_t = torch.bmm(
+            attention.to(logits_t.dtype),
+            logits_t
+        )  # (seq_len, N, vocab_size)
+        blended_t = (1 - lambda_blend) * logits_t + lambda_blend * contextual_t
+
+        # Reshape back to (N, seq_len, vocab_size)
+        blended = blended_t.permute(1, 0, 2)
+
+        if debug:
+            diff = (blended - logits).abs().mean().item()
+            print(f"[M3PO LOGITS] Baseline cosine, N={N}, seq_len={seq_len}, mean_change={diff:.6f}")
+
+        return blended
 
 
 @torch.no_grad()
@@ -381,5 +498,6 @@ __all__ = [
     "compute_cross_path_attention",
     "blend_token_embeddings",
     "apply_m3po_step",
+    "apply_m3po_to_logits",
     "generate_with_m3po",
 ]

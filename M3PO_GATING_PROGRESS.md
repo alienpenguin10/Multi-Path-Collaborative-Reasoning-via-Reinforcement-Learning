@@ -64,21 +64,41 @@ This document tracks the implementation of alternative gating functions for M3PO
 
 **Status**: All parameter-free variants implemented and tested ✓
 
-### 🔄 Phase 3: Learnable Gating Infrastructure (NEXT)
+### ✅ Phase 3: Learnable Gating Infrastructure (COMPLETED)
 
 **Goal**: Enable gradient flow for learnable gating parameters.
 
-- [ ] **Task 3.1**: Modify GRPO loss to apply M3PO during forward pass
-  - Apply gating to logits before computing log probabilities
-  - Enables gradient flow to learnable parameters
+- [x] **Task 3.1**: Create `apply_m3po_to_logits()` function in `m3po_utils.py`
+  - Applies M3PO cross-path logit blending for loss computation
+  - Vectorized baseline (cosine) path using `torch.bmm`
+  - Per-position loop for custom gating functions
+  - Supports completion mask for skipping padded positions
 
-- [ ] **Task 3.2**: Create `apply_m3po_to_logits()` function
-  - Applies M3PO gating to output logits
-  - Handles batching per question group
+- [x] **Task 3.2**: Create `compute_log_probs_with_m3po()` in `grpo_train.py`
+  - Chunks by question group (N paths together) for cross-path interaction
+  - Calls `apply_m3po_to_logits()` then computes log probs from blended logits
 
-- [ ] **Task 3.3**: Test gradient flow
-  - Unit test for gradient computation
-  - Verify no NaN/Inf in gradients
+- [x] **Task 3.3**: Modify GRPO loss to apply M3PO during forward pass
+  - `grpo_loss()` accepts `use_m3po`, `lambda_blend`, `temperature_m3po`, `gating_function`
+  - Conditionally uses `compute_log_probs_with_m3po()` when `use_m3po=True AND gating_function is not None`
+  - Only `token_log_probs` gets M3PO; `old_log_probs` and `ref_log_probs` stay unchanged
+
+- [x] **Task 3.4**: Modify `train_with_grpo()` for learnable parameters
+  - Learnable gating params included in optimizer
+  - Learnable gating params included in gradient clipping
+  - Gating statistics logged to wandb (`m3po/*` keys)
+  - Stats reset after each logging step
+
+- [x] **Task 3.5**: Test gradient flow (`test_gradient_flow.py`)
+  - Gradient flow to input logits (baseline cosine) ✓
+  - Gradient flow to learnable parameters (mock bilinear gating) ✓
+  - Numerical stability with extreme logit values ✓
+  - Backward compatibility (lambda=0 → no change) ✓
+  - All registered gating functions ✓
+  - Completion mask handling ✓
+
+- [x] **Task 3.6**: Fix KL divergence gradient stability
+  - `torch.sqrt(jsd.clamp(min=0))` → `torch.sqrt(jsd.clamp(min=1e-12))` to avoid infinite gradient at 0
 
 ### ⏳ Phase 4: Learnable Variants (PENDING)
 
@@ -204,8 +224,9 @@ transformers/src/transformers/models/qwen2/
 │   ├── learnable_gates.py             # Learnable implementations (pending)
 │   └── factory.py                     # Factory pattern
 
-grpo_train.py                          # Modified for gating support
-test_gating_infrastructure.py          # Test suite
+grpo_train.py                          # Modified for gating support + M3PO loss path
+test_gating_infrastructure.py          # Phase 1-2 test suite
+test_gradient_flow.py                  # Phase 3 gradient flow tests
 ```
 
 ## Architecture Details
@@ -253,11 +274,7 @@ Attention weights (first 3x3):
 
 ## Next Steps
 
-1. **Phase 3**: Implement learnable gating infrastructure
-   - Modify GRPO loss to apply M3PO during forward pass
-   - Test gradient flow for learnable parameters
-
-2. **Phase 4**: Implement Luong and Bahdanau attention
+1. **Phase 4**: Implement Luong and Bahdanau attention
    - Low-rank Luong attention (rank=128)
    - Bahdanau MLP-style attention (dim=256)
 
@@ -270,11 +287,11 @@ Attention weights (first 3x3):
 
 - ✅ Phase 1 (Infrastructure): 2 days → **DONE**
 - ✅ Phase 2 (Parameter-Free): 5 days → **DONE** (completed early!)
-- ⏳ Phase 3 (Learnable Infrastructure): 3 days → **IN PROGRESS**
+- ✅ Phase 3 (Learnable Infrastructure): 3 days → **DONE**
 - ⏳ Phase 4 (Learnable Variants): 5 days
 - ⏳ Phase 5 (Experiments): 4 days + 3-4 days compute
 
-**Total Progress**: ~35% complete (7/19 days of development)
+**Total Progress**: ~53% complete (10/19 days of development)
 
 ## Known Issues & Limitations
 

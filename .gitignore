@@ -15,3 +15,5 @@ Reports/
 .claude/
 CLAUDE.md
 .DS_Store
+gpu_monitor.log
+plans/

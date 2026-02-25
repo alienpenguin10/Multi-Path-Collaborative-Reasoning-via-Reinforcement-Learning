@@ -5,13 +5,28 @@ GPU Monitor Script - Automatically runs grpo_train.py when 4+ GPUs are free.
 A GPU is considered "free" if:
 - GPU utilization is 0%
 - Memory usage is < 500 MiB (allows for base driver memory)
+
+The script:
+1. Polls nvidia-smi every 60 seconds
+2. When enough GPUs are free, sets CUDA_VISIBLE_DEVICES to only those GPUs
+3. Activates the conda environment and launches grpo_train.py
 """
 
 import subprocess
+import os
 import time
-import re
 import sys
 from datetime import datetime
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+REQUIRED_FREE_GPUS = 2          # Minimum free GPUs needed to launch
+CHECK_INTERVAL = 240             # Seconds between checks
+MEMORY_THRESHOLD_MB = 500       # GPU is "free" if memory < this
+CONDA_ENV = "base"              # Conda environment name
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRAIN_SCRIPT = os.path.join(SCRIPT_DIR, "grpo_train.py")
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def get_gpu_status():
@@ -44,47 +59,72 @@ def get_gpu_status():
         return []
 
 
-def count_free_gpus(gpus, memory_threshold_mb=500):
+def find_free_gpus(gpus, memory_threshold_mb=500):
+    """Return list of GPU IDs that are free (0% util and < threshold memory)."""
+    return [
+        gpu['gpu_id'] for gpu in gpus
+        if gpu['util_percent'] == 0 and gpu['memory_used_mb'] < memory_threshold_mb
+    ]
+
+
+def launch_training(free_gpu_ids):
     """
-    Count GPUs that are free (0% util and < threshold memory usage).
+    Launch grpo_train.py with CUDA_VISIBLE_DEVICES set to only the free GPUs.
+
+    grpo_train.py uses nn.DataParallel with device_ids=list(range(torch.cuda.device_count())),
+    so setting CUDA_VISIBLE_DEVICES is the correct way to control which GPUs it uses.
+    The script will see them as GPU 0, 1, 2, ... regardless of physical IDs.
     """
-    free_gpus = []
-    for gpu in gpus:
-        if gpu['util_percent'] == 0 and gpu['memory_used_mb'] < memory_threshold_mb:
-            free_gpus.append(gpu['gpu_id'])
-    return free_gpus
+    gpu_str = ",".join(str(g) for g in free_gpu_ids)
+
+    # Build environment: inherit current env + set CUDA_VISIBLE_DEVICES
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_str
+
+    print(f"Setting CUDA_VISIBLE_DEVICES={gpu_str}")
+    print(f"Training will see {len(free_gpu_ids)} GPUs (remapped as 0..{len(free_gpu_ids)-1})")
+    print(f"Running: python {TRAIN_SCRIPT}")
+    print(f"{'='*60}\n")
+
+    # Use the current Python interpreter (inherits the active conda env)
+    subprocess.run(
+        [sys.executable, TRAIN_SCRIPT],
+        env=env,
+        cwd=SCRIPT_DIR,
+        check=True,
+    )
 
 
 def main():
-    check_interval = 60  # Check every 60 seconds
-    required_free_gpus = 4
-    memory_threshold_mb = 500  # Consider GPU free if < 500 MiB used
-
     print(f"GPU Monitor Started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Waiting for {required_free_gpus}+ GPUs to be free...")
-    print(f"(Free = 0% utilization and < {memory_threshold_mb} MiB memory used)")
-    print(f"Checking every {check_interval} seconds...\n")
+    print(f"  Python:    {sys.executable}")
+    print(f"  Conda env: {os.environ.get('CONDA_DEFAULT_ENV', 'N/A')}")
+    print(f"  Script:    {TRAIN_SCRIPT}")
+    print(f"  Requires:  {REQUIRED_FREE_GPUS}+ free GPUs")
+    print(f"  Free = 0% utilization AND < {MEMORY_THRESHOLD_MB} MiB memory")
+    print(f"  Checking every {CHECK_INTERVAL} seconds...\n")
 
     while True:
         gpus = get_gpu_status()
         if not gpus:
             print("Warning: Could not get GPU status, retrying...")
-            time.sleep(check_interval)
+            time.sleep(CHECK_INTERVAL)
             continue
 
-        free_gpu_ids = count_free_gpus(gpus, memory_threshold_mb)
+        free_gpu_ids = find_free_gpus(gpus, MEMORY_THRESHOLD_MB)
         num_free = len(free_gpu_ids)
 
         timestamp = datetime.now().strftime('%H:%M:%S')
         print(f"[{timestamp}] Free GPUs: {num_free}/{len(gpus)} - IDs: {free_gpu_ids if free_gpu_ids else 'none'}")
 
-        if num_free >= required_free_gpus:
-            print(f"\n✓ {num_free} GPUs are now free!")
-            print(f"Launching grpo_train.py...\n")
+        if num_free >= REQUIRED_FREE_GPUS:
+            print(f"\n{'='*60}")
+            print(f"{num_free} GPUs are free! Launching training...")
+            print(f"Using GPUs: {free_gpu_ids}")
+            print(f"{'='*60}\n")
 
-            # Launch the training script
             try:
-                subprocess.run(['python', 'grpo_train.py'], check=True)
+                launch_training(free_gpu_ids)
                 print("\nTraining completed successfully!")
                 sys.exit(0)
             except subprocess.CalledProcessError as e:
@@ -94,9 +134,8 @@ def main():
                 print("\nTraining interrupted by user")
                 sys.exit(130)
 
-        # Wait before next check
         try:
-            time.sleep(check_interval)
+            time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             print("\nMonitoring stopped by user")
             sys.exit(0)

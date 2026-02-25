@@ -8,7 +8,8 @@ import copy
 import os
 import numpy as np
 import wandb
-
+import sys
+import os
 
 # PyTorch and related libraries for deep learning
 import torch
@@ -16,17 +17,21 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
 # Hugging Face libraries for transformer models
+sys.path.insert(0, os.path.abspath("transformers/src"))
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 os.environ["M3PO_DEBUG"] = "-1"  # Enable M3PO debug prints
 
+from dotenv import load_dotenv
+load_dotenv()
 # Call the function to set random seed for reproducibility
 from utils import set_random_seed   
 set_random_seed(42)
 
+
 # Set environment variables for Weights & Biases (wandb) logging
-os.environ["WANDB_API_KEY"] = ""
-os.environ["WANDB_PROJECT"] = "latent-space-reasoning"
+os.environ["WANDB_API_KEY"] = os.getenv("WANDB_API_KEY")
+os.environ["WANDB_PROJECT"] = os.getenv("WANDB_PROJECT")
 
 """
 Part 2: Data Formatting and Answer Extraction
@@ -145,6 +150,82 @@ def compute_log_probs(model, input_ids, attention_mask, logits_to_keep, chunk_si
         del chunk_logits, log_probs
 
     return torch.cat(results, dim=0)
+
+def compute_log_probs_with_m3po(model, input_ids, attention_mask, logits_to_keep,
+                                batch_size, num_generations,
+                                lambda_blend=0.1, temperature_m3po=0.1,
+                                gating_function=None, completion_mask=None):
+    """
+    Computes log probabilities with M3PO cross-path logit blending.
+
+    Unlike compute_log_probs() which chunks by chunk_size=2, this function chunks
+    by question group (N paths together) because M3PO needs all paths for cross-path
+    interaction within each group.
+
+    This creates a differentiable path:
+        loss → log_probs → blended_logits → attention_weights → similarity_matrix → gating_parameters
+
+    Args:
+        model: The language model.
+        input_ids: Token IDs for input sequences (batch_size * N, seq_len).
+        attention_mask: Attention mask (batch_size * N, seq_len).
+        logits_to_keep: Number of tokens to keep from the end.
+        batch_size: Number of questions in the batch.
+        num_generations: Number of paths per question (N).
+        lambda_blend: M3PO blending coefficient.
+        temperature_m3po: M3PO attention temperature.
+        gating_function: Optional BaseM3POGating instance.
+        completion_mask: Optional (batch_size * N, logits_to_keep) binary mask.
+
+    Returns:
+        torch.Tensor: Log probabilities with M3PO blending applied.
+    """
+    from transformers.models.qwen2.m3po_utils import apply_m3po_to_logits
+
+    total_sequences = input_ids.shape[0]
+    N = num_generations
+
+    results = []
+    for b in range(batch_size):
+        start_idx = b * N
+        end_idx = (b + 1) * N
+
+        # Get this question group's data
+        group_ids = input_ids[start_idx:end_idx]
+        group_mask = attention_mask[start_idx:end_idx]
+
+        # Forward pass for this group
+        group_logits = model(input_ids=group_ids, attention_mask=group_mask).logits[:, :-1, :]
+
+        # Keep only completion tokens
+        group_logits = group_logits[:, -logits_to_keep:, :]  # (N, logits_to_keep, vocab_size)
+        group_token_ids = group_ids[:, -logits_to_keep:]  # (N, logits_to_keep)
+
+        # Get completion mask for this group if provided
+        group_completion_mask = None
+        if completion_mask is not None:
+            group_completion_mask = completion_mask[start_idx:end_idx]  # (N, logits_to_keep)
+
+        # Apply M3PO logit blending (differentiable)
+        blended_logits = apply_m3po_to_logits(
+            logits=group_logits,
+            num_generations=N,
+            lambda_blend=lambda_blend,
+            temperature=temperature_m3po,
+            gating_function=gating_function,
+            completion_mask=group_completion_mask,
+        )
+
+        # Compute log probs from blended logits
+        log_probs = nn.functional.log_softmax(blended_logits, dim=-1)
+        token_log_probs = log_probs.gather(dim=-1, index=group_token_ids.unsqueeze(-1)).squeeze(-1)
+        results.append(token_log_probs)
+
+        # Free memory
+        del group_logits, blended_logits, log_probs
+
+    return torch.cat(results, dim=0)
+
 
 def detect_thinking_phase_end(tokenizer, completion_ids):
     """
@@ -370,7 +451,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         "num_generations": num_generations
     }
 
-def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0.01, epsilon=0.2, verbose=False):
+def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0.01, epsilon=0.2, verbose=False,
+              use_m3po=False, lambda_blend=0.1, temperature_m3po=0.1, gating_function=None):
     """
     Computes the GRPO loss for updating the policy model.
 
@@ -404,7 +486,16 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
     logits_to_keep = rollout_data["logits_to_keep"]
     old_log_probs = rollout_data["old_log_probs"]
     ref_log_probs = rollout_data["ref_log_probs"]
-    token_log_probs = compute_log_probs(model, input_ids, attention_mask, logits_to_keep)
+    if use_m3po and gating_function is not None:
+        token_log_probs = compute_log_probs_with_m3po(
+            model, input_ids, attention_mask, logits_to_keep,
+            batch_size=rollout_data["batch_size"],
+            num_generations=rollout_data["num_generations"],
+            lambda_blend=lambda_blend, temperature_m3po=temperature_m3po,
+            gating_function=gating_function, completion_mask=completion_mask,
+        )
+    else:
+        token_log_probs = compute_log_probs(model, input_ids, attention_mask, logits_to_keep)
     ratio = torch.exp(token_log_probs - old_log_probs)
     rewards_list = reward_function(prompts=rollout_data["repeated_prompts"], completions=rollout_data["formatted_completions"], answer=rollout_data["repeated_answers"])
     rewards = torch.tensor(
@@ -575,8 +666,12 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
 
         # Reinitialize the optimizer for this iteration with M3PO paper parameters.
         # Paper Table 3: weight_decay=0.1, betas=(0.9, 0.99)
+        params_to_optimize = list(model.parameters())
+        if gating_function is not None and gating_function.has_learnable_parameters:
+            gating_function = gating_function.to(device)
+            params_to_optimize.extend(gating_function.parameters())
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            params_to_optimize,
             lr=learning_rate,
             weight_decay=0.1,
             betas=(0.9, 0.99)
@@ -611,20 +706,33 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     reward_function,
                     beta=beta,
                     epsilon=epsilon,
-                    verbose=verbose_output
+                    verbose=verbose_output,
+                    use_m3po=use_m3po,
+                    lambda_blend=lambda_blend,
+                    temperature_m3po=temperature_m3po,
+                    gating_function=gating_function,
                 )
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                all_params = list(model.parameters())
+                if gating_function is not None and gating_function.has_learnable_parameters:
+                    all_params.extend(gating_function.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.1)
                 optimizer.step()
                 # Log to wandb
-                wandb.log({
+                log_dict = {
                     "loss": loss.item(),
                     "average_reward": avg_reward,
                     "iteration": iteration + 1,
                     "step": step + 1,
                     "grpo_iter": grpo_iter + 1
-                })
+                }
+                if gating_function is not None:
+                    stats = gating_function.get_stats_summary()
+                    for key, value in stats.items():
+                        log_dict[f"m3po/{key}"] = value
+                    gating_function.reset_stats()
+                wandb.log(log_dict)
                 print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps}, "
                       f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}")
                 #for i in range(torch.cuda.device_count()):
@@ -688,15 +796,15 @@ if __name__ == "__main__":
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     output_dir = "math_solver_model"
 
-    print("Loading fine-tuned model from grpo_finetuned_model...")
+    print(f"Loading fine-tuned model from {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
-        "grpo_finetuned_model",
+        model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
     print("Fine-tuned model loaded")
 
-    tokenizer = AutoTokenizer.from_pretrained("grpo_finetuned_model", padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
     model.config.pad_token_id = tokenizer.eos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -735,7 +843,7 @@ if __name__ == "__main__":
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
         # Gating function selection (for research on alternative gating mechanisms)
-        'gating_type': 'baseline',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
+        'gating_type': 'kl_divergence',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # Will override temperature_m3po if gating is used
             'debug': False,                # Enable debug logging
@@ -743,9 +851,9 @@ if __name__ == "__main__":
     }
 
     # Initialize Weights & Biases
-    # wandb.init(project=os.environ["WANDB_PROJECT"], name="M3PO", reinit=True)
-    # print("Weights & Biases initialized.")
-
+    wandb.init(project=os.getenv("WANDB_PROJECT"), name=f"M3PO {training_config['gating_type']}", reinit=True)
+    print("Weights & Biases initialized.")
+    
     model = train_with_grpo(
         model=model,
         tokenizer=tokenizer,
@@ -755,16 +863,16 @@ if __name__ == "__main__":
         **training_config
     )
 
-    # wandb.finish()
-    # print("Training completed and wandb run finished.")
+    wandb.finish()
+    print("Training completed and wandb run finished.")
 
     print("\nFinal model evaluation after GRPO RL fine-tuning:")
     post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
-    # print("\nSaving GRPO fine-tuned model...")
-    # model.save_pretrained("grpo_finetuned_model")
-    # tokenizer.save_pretrained("grpo_finetuned_model")
+    print("\nSaving GRPO fine-tuned model...")
+    model.save_pretrained("grpo_finetuned_model")
+    tokenizer.save_pretrained("grpo_finetuned_model")
 
     # # Push to Hugging Face Hub
     # print("\nPushing model to Hugging Face Hub...")

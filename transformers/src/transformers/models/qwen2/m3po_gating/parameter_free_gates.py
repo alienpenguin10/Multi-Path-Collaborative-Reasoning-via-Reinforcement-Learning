@@ -158,7 +158,8 @@ class KLDivergenceGating(BaseM3POGating):
 
                 # Convert to similarity: 1 - sqrt(JSD)
                 # sqrt brings it from [0, log(2)] to [0, sqrt(log(2))] ≈ [0, 0.83]
-                similarity = 1.0 - torch.sqrt(jsd.clamp(min=0))
+                # Clamp to small positive value to avoid infinite gradient of sqrt at 0
+                similarity = 1.0 - torch.sqrt(jsd.clamp(min=1e-12))
 
                 similarity_matrix[i, j] = similarity
                 similarity_matrix[j, i] = similarity  # Symmetric

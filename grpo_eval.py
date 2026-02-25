@@ -1,10 +1,12 @@
 ###########################
 # Step 4. LOAD AND TEST MODEL  #
 ###########################
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from grpo_train import SYSTEM_PROMPT, build_prompt, extract_answer_from_model_output, extract_single_number, extract_last_number, prepare_dataset
-import torch
+import sys
 import os
+sys.path.insert(0, os.path.abspath("transformers/src"))
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from utils import SYSTEM_PROMPT, build_prompt, extract_answer_from_model_output, extract_single_number, extract_last_number, prepare_dataset
+import torch
 
 def evaluate_model(model, tokenizer, eval_examples, device):
    """
@@ -199,7 +201,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Load the saved model and tokenizer
-    saved_model_path = "grpo_finetuned_model"
+    saved_model_path = "outputs/kl"
 
     # Load the model
     print("Loading model...")
