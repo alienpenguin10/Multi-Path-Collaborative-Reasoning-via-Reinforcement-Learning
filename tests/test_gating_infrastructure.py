@@ -25,7 +25,7 @@ def test_gating_function(gating_type, vocab_size=1000, num_paths=4):
     print(f"{'='*60}")
 
     # Create gating function
-    config = {'temperature': 0.1, 'debug': False}
+    config = {'temperature': 0.1, 'debug': False, 'vocab_size': vocab_size, 'rank': 32, 'attn_dim': 64}
     gating_fn = create_gating_function(gating_type, config)
 
     if gating_fn is None:

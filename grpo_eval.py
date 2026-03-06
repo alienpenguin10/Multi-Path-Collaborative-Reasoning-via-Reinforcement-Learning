@@ -201,7 +201,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Load the saved model and tokenizer
-    saved_model_path = "outputs/kl"
+    saved_model_path = "outputs/kl_divergence"
 
     # Load the model
     print("Loading model...")
@@ -219,6 +219,21 @@ if __name__ == "__main__":
     eval_data = prepare_dataset("test") 
 
 
+    import json
+    from datetime import datetime
+
     print("\nFinal model evaluation after GRPO RL fine-tuning:")
     post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
+
+    results = {
+        "gating_type": "kl_divergence",
+        "accuracy": post_grpo_accuracy,
+        "eval_size": len(eval_data),
+        "model_path": saved_model_path,
+        "timestamp": datetime.now().isoformat(),
+    }
+    results_path = os.path.join(saved_model_path, "full_eval_results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Results saved to {results_path}")

@@ -23,9 +23,12 @@ from datetime import datetime
 REQUIRED_FREE_GPUS = 2          # Minimum free GPUs needed to launch
 CHECK_INTERVAL = 240             # Seconds between checks
 MEMORY_THRESHOLD_MB = 500       # GPU is "free" if memory < this
-CONDA_ENV = "base"              # Conda environment name
+CONDA_ENV = "ant"               # Conda environment name
+CONDA_PYTHON = os.path.expanduser("~/Neuralese/miniconda3/envs/ant/bin/python")
+TARGET_GPUS = None               # Consider all GPUs (set to list like [3, 6, 7] to restrict)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAIN_SCRIPT = os.path.join(SCRIPT_DIR, "grpo_train.py")
+EXPERIMENT_SCRIPT = os.path.join(SCRIPT_DIR, "run_m3po_experiment.py")
+EXPERIMENT_ARGS = ["--gating_type", "baseline", "--trial", "1"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -69,9 +72,9 @@ def find_free_gpus(gpus, memory_threshold_mb=500):
 
 def launch_training(free_gpu_ids):
     """
-    Launch grpo_train.py with CUDA_VISIBLE_DEVICES set to only the free GPUs.
+    Launch run_m3po_experiment.py with CUDA_VISIBLE_DEVICES set to only the free GPUs.
 
-    grpo_train.py uses nn.DataParallel with device_ids=list(range(torch.cuda.device_count())),
+    The experiment script uses nn.DataParallel with device_ids=list(range(torch.cuda.device_count())),
     so setting CUDA_VISIBLE_DEVICES is the correct way to control which GPUs it uses.
     The script will see them as GPU 0, 1, 2, ... regardless of physical IDs.
     """
@@ -81,14 +84,15 @@ def launch_training(free_gpu_ids):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_str
 
+    cmd = [CONDA_PYTHON, EXPERIMENT_SCRIPT] + EXPERIMENT_ARGS
     print(f"Setting CUDA_VISIBLE_DEVICES={gpu_str}")
     print(f"Training will see {len(free_gpu_ids)} GPUs (remapped as 0..{len(free_gpu_ids)-1})")
-    print(f"Running: python {TRAIN_SCRIPT}")
+    print(f"Running: {' '.join(cmd)}")
     print(f"{'='*60}\n")
 
     # Use the current Python interpreter (inherits the active conda env)
     subprocess.run(
-        [sys.executable, TRAIN_SCRIPT],
+        cmd,
         env=env,
         cwd=SCRIPT_DIR,
         check=True,
@@ -99,7 +103,8 @@ def main():
     print(f"GPU Monitor Started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Python:    {sys.executable}")
     print(f"  Conda env: {os.environ.get('CONDA_DEFAULT_ENV', 'N/A')}")
-    print(f"  Script:    {TRAIN_SCRIPT}")
+    print(f"  Script:    {EXPERIMENT_SCRIPT}")
+    print(f"  Args:      {EXPERIMENT_ARGS}")
     print(f"  Requires:  {REQUIRED_FREE_GPUS}+ free GPUs")
     print(f"  Free = 0% utilization AND < {MEMORY_THRESHOLD_MB} MiB memory")
     print(f"  Checking every {CHECK_INTERVAL} seconds...\n")
@@ -111,7 +116,8 @@ def main():
             time.sleep(CHECK_INTERVAL)
             continue
 
-        free_gpu_ids = find_free_gpus(gpus, MEMORY_THRESHOLD_MB)
+        all_free = find_free_gpus(gpus, MEMORY_THRESHOLD_MB)
+        free_gpu_ids = [g for g in all_free if g in TARGET_GPUS] if TARGET_GPUS else all_free
         num_free = len(free_gpu_ids)
 
         timestamp = datetime.now().strftime('%H:%M:%S')

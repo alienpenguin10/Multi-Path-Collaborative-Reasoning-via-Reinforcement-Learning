@@ -6,10 +6,14 @@ Part 1: Basic Setup and Imports
 import random
 import copy
 import os
+import json
 import numpy as np
 import wandb
 import sys
 import os
+
+# Must be set before any CUDA operations to prevent memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # PyTorch and related libraries for deep learning
 import torch
@@ -126,7 +130,7 @@ def compute_log_probs(model, input_ids, attention_mask, logits_to_keep, chunk_si
 
     # If batch is small enough, process all at once
     if batch_size <= chunk_size:
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, :-1, :]
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits[:, :-1, :]
         ids_to_keep = input_ids[:, -logits_to_keep:]
         logits = logits[:, -logits_to_keep:, :]
         return selective_log_softmax(logits, ids_to_keep)
@@ -137,7 +141,7 @@ def compute_log_probs(model, input_ids, attention_mask, logits_to_keep, chunk_si
         chunk_ids = input_ids[i:i+chunk_size]
         chunk_mask = attention_mask[i:i+chunk_size]
 
-        chunk_logits = model(input_ids=chunk_ids, attention_mask=chunk_mask).logits[:, :-1, :]
+        chunk_logits = model(input_ids=chunk_ids, attention_mask=chunk_mask, logits_to_keep=logits_to_keep + 1).logits[:, :-1, :]
         chunk_ids_to_keep = chunk_ids[:, -logits_to_keep:]
         chunk_logits = chunk_logits[:, -logits_to_keep:, :]
 
@@ -194,11 +198,11 @@ def compute_log_probs_with_m3po(model, input_ids, attention_mask, logits_to_keep
         group_ids = input_ids[start_idx:end_idx]
         group_mask = attention_mask[start_idx:end_idx]
 
-        # Forward pass for this group
-        group_logits = model(input_ids=group_ids, attention_mask=group_mask).logits[:, :-1, :]
-
-        # Keep only completion tokens
-        group_logits = group_logits[:, -logits_to_keep:, :]  # (N, logits_to_keep, vocab_size)
+        # Forward pass for this group — only project last logits_to_keep+1 positions through lm_head
+        group_logits = model(
+            input_ids=group_ids, attention_mask=group_mask,
+            logits_to_keep=logits_to_keep + 1,
+        ).logits[:, :-1, :]  # (N, logits_to_keep, vocab_size)
         group_token_ids = group_ids[:, -logits_to_keep:]  # (N, logits_to_keep)
 
         # Get completion mask for this group if provided
@@ -221,7 +225,7 @@ def compute_log_probs_with_m3po(model, input_ids, attention_mask, logits_to_keep
         token_log_probs = log_probs.gather(dim=-1, index=group_token_ids.unsqueeze(-1)).squeeze(-1)
         results.append(token_log_probs)
 
-        # Free memory
+        # Free intermediates between groups (stays in PyTorch's cache, not released to CUDA)
         del group_logits, blended_logits, log_probs
 
     return torch.cat(results, dim=0)
@@ -486,7 +490,7 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
     logits_to_keep = rollout_data["logits_to_keep"]
     old_log_probs = rollout_data["old_log_probs"]
     ref_log_probs = rollout_data["ref_log_probs"]
-    if use_m3po and gating_function is not None:
+    if use_m3po and gating_function is not None and gating_function.has_learnable_parameters:
         token_log_probs = compute_log_probs_with_m3po(
             model, input_ids, attention_mask, logits_to_keep,
             batch_size=rollout_data["batch_size"],
@@ -582,7 +586,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                               num_generations=4, max_completion_length=128, beta=0.1,
                               learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None, device_ids=None,
                               lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True,
-                              gating_type='baseline', gating_config=None):
+                              gating_type='baseline', gating_config=None,
+                              gating_warmup_steps=0, gating_lr=None, gating_grad_clip=None):
     """
     Train with GRPO + M3PO (Multi-Path Perception Policy Optimization).
 
@@ -666,20 +671,60 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
 
         # Reinitialize the optimizer for this iteration with M3PO paper parameters.
         # Paper Table 3: weight_decay=0.1, betas=(0.9, 0.99)
-        params_to_optimize = list(model.parameters())
-        if gating_function is not None and gating_function.has_learnable_parameters:
+        has_learnable_gating = gating_function is not None and gating_function.has_learnable_parameters
+        if has_learnable_gating:
             gating_function = gating_function.to(device)
-            params_to_optimize.extend(gating_function.parameters())
-        optimizer = torch.optim.AdamW(
-            params_to_optimize,
-            lr=learning_rate,
-            weight_decay=0.1,
-            betas=(0.9, 0.99)
-        )
+            effective_gating_lr = gating_lr if gating_lr is not None else learning_rate * 100
+            effective_gating_grad_clip = gating_grad_clip if gating_grad_clip is not None else 1.0
+
+        if has_learnable_gating and gating_warmup_steps > 0:
+            # Phase 1: freeze model, train only gating params
+            for param in model.parameters():
+                param.requires_grad = False
+            optimizer = torch.optim.AdamW(
+                list(gating_function.parameters()),
+                lr=effective_gating_lr,
+                weight_decay=0.1,
+                betas=(0.9, 0.99),
+            )
+            print(f"[M3PO] Phase 1 (warmup): training only gating params for {gating_warmup_steps} steps at lr={effective_gating_lr}")
+        else:
+            # Standard optimizer (no warmup or no learnable gating)
+            if has_learnable_gating:
+                optimizer = torch.optim.AdamW(
+                    [
+                        {"params": list(model.parameters()), "lr": learning_rate},
+                        {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
+                    ],
+                    weight_decay=0.1,
+                    betas=(0.9, 0.99),
+                )
+            else:
+                params_to_optimize = list(model.parameters())
+                optimizer = torch.optim.AdamW(
+                    params_to_optimize,
+                    lr=learning_rate,
+                    weight_decay=0.1,
+                    betas=(0.9, 0.99),
+                )
         model.train()
 
         # Inner loop: your original training steps.
         for step in range(num_steps):
+            # Phase transition: unfreeze model after warmup
+            if has_learnable_gating and gating_warmup_steps > 0 and step == gating_warmup_steps:
+                print(f"[M3PO] Phase 2: unfreezing model weights, training model + gating params")
+                for param in model.parameters():
+                    param.requires_grad = True
+                optimizer = torch.optim.AdamW(
+                    [
+                        {"params": list(model.parameters()), "lr": learning_rate},
+                        {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
+                    ],
+                    weight_decay=0.1,
+                    betas=(0.9, 0.99),
+                )
+
             batch_samples = random.sample(train_data, batch_size)
             with torch.no_grad():
                 rollout_data = generate_rollout_data(
@@ -714,10 +759,14 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 )
                 optimizer.zero_grad()
                 loss.backward()
-                all_params = list(model.parameters())
-                if gating_function is not None and gating_function.has_learnable_parameters:
-                    all_params.extend(gating_function.parameters())
-                torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.1)
+                # Separate gradient clipping for model and gating params
+                if has_learnable_gating:
+                    if step >= gating_warmup_steps or gating_warmup_steps == 0:
+                        # Phase 2 (or no warmup): clip model and gating separately
+                        torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
+                    torch.nn.utils.clip_grad_norm_(list(gating_function.parameters()), max_norm=effective_gating_grad_clip)
+                else:
+                    torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
                 optimizer.step()
                 # Log to wandb
                 log_dict = {
@@ -727,6 +776,11 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     "step": step + 1,
                     "grpo_iter": grpo_iter + 1
                 }
+                if has_learnable_gating:
+                    gating_grad_norm = sum(
+                        p.grad.norm().item() ** 2 for p in gating_function.parameters() if p.grad is not None
+                    ) ** 0.5
+                    log_dict["m3po/gating_grad_norm"] = gating_grad_norm
                 if gating_function is not None:
                     stats = gating_function.get_stats_summary()
                     for key, value in stats.items():
@@ -753,6 +807,34 @@ Step 1: The model is evaluated before fine-tuning to establish a baseline accura
 Step 2: Reinforcement learning fine-tuning is performed using the train_with_grpo function with our defined reward functions (format_reward and correctness_reward, combined into combined_reward). The model is trained using a multi-GPU.
 Step 3: The final, fine-tuned model and tokenizer are saved to disk.
 """
+def reserve_gpu_memory(fraction=0.80):
+    """
+    Pre-allocate GPU memory on all visible devices so other processes cannot use them.
+
+    PyTorch's CUDA caching allocator holds onto memory even after tensors are freed.
+    By allocating a large tensor and immediately freeing it, the memory stays in
+    PyTorch's cache (shown as "used" in nvidia-smi to other processes).
+
+    IMPORTANT: Do NOT call torch.cuda.empty_cache() during training — that releases
+    the reserved memory back to CUDA, allowing other processes to steal it.
+
+    Args:
+        fraction: Fraction of free GPU memory to reserve (default: 0.92).
+    """
+    num_gpus = torch.cuda.device_count()
+    for i in range(num_gpus):
+        free_mem, total_mem = torch.cuda.mem_get_info(i)
+        alloc_bytes = int(free_mem * fraction)
+        alloc_elements = alloc_bytes // 4  # float32 = 4 bytes
+        if alloc_elements > 0:
+            tmp = torch.empty(alloc_elements, dtype=torch.float32, device=f'cuda:{i}')
+            del tmp
+            reserved_gb = alloc_bytes / (1024**3)
+            total_gb = total_mem / (1024**3)
+            print(f"  GPU {i}: reserved {reserved_gb:.1f} GiB / {total_gb:.1f} GiB")
+    print(f"  GPU memory locked — other processes will see these GPUs as occupied.")
+
+
 def optimize_model_memory(model):
     """
     Optimizes the model to use less memory during training.
@@ -825,6 +907,10 @@ if __name__ == "__main__":
 
     model = optimize_model_memory(model)
 
+    # Reserve remaining GPU memory AFTER model is loaded to avoid fragmentation
+    print("Reserving GPU memory...")
+    reserve_gpu_memory()
+
     print("\nStarting RL fine-tuning using M3PO (Multi-Path Perception Policy Optimization)...")
     # This config follows the M3PO paper (Table 3, page 12)
     # Tested on 8xA100 node with 80GB VRAM each
@@ -846,8 +932,13 @@ if __name__ == "__main__":
         'gating_type': 'kl_divergence',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # Will override temperature_m3po if gating is used
+            'rank': 2048,                  # Low-rank factorization rank (Luong/Bahdanau)
+            'init_strategy': 'identity',   # 'identity' (QR-based) or 'xavier'
             'debug': False,                # Enable debug logging
         },
+        'gating_warmup_steps': 50,         # Phase 1: train only gating params (10% of 500 steps)
+        'gating_lr': 5e-4,                 # 100x model LR for randomly-initialized gating params
+        'gating_grad_clip': 1.0,           # Separate grad clip for gating (10x less aggressive)
     }
 
     # Initialize Weights & Biases
@@ -870,14 +961,15 @@ if __name__ == "__main__":
     post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
-    print("\nSaving GRPO fine-tuned model...")
-    model.save_pretrained("grpo_finetuned_model")
-    tokenizer.save_pretrained("grpo_finetuned_model")
+    save_dir = training_config.get('output_dir', 'grpo_finetuned_model')
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"\nSaving GRPO fine-tuned model to {save_dir}...")
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
 
-    # # Push to Hugging Face Hub
-    # print("\nPushing model to Hugging Face Hub...")
-    # from huggingface_hub import login
-    # login(token="")
-    # model.push_to_hub("Alienpenguin10/M3PO")
-    # tokenizer.push_to_hub("Alienpenguin10/M3PO")
-    # print("Model pushed to Hugging Face Hub: Alienpenguin10/M3PO")
+    # Save training config and results for experiment tracking
+    serializable_config = {k: v for k, v in training_config.items() if isinstance(v, (int, float, str, bool, dict, list))}
+    with open(os.path.join(save_dir, "training_config.json"), "w") as f:
+        json.dump(serializable_config, f, indent=2)
+    with open(os.path.join(save_dir, "results.json"), "w") as f:
+        json.dump({"accuracy": post_grpo_accuracy}, f, indent=2)

@@ -223,7 +223,7 @@ def test_all_gating_functions():
         torch.manual_seed(42)
         logits = torch.randn(N, seq_len, vocab_size, requires_grad=True)
 
-        config = {"temperature": 0.1, "debug": False}
+        config = {"temperature": 0.1, "debug": False, "vocab_size": vocab_size, "rank": 32, "attn_dim": 64}
         gating_fn = create_gating_function(gating_type, config)
 
         try:

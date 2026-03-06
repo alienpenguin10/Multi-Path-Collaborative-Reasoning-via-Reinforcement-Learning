@@ -24,6 +24,7 @@ Therefore, this implementation:
 import os
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -290,37 +291,53 @@ def apply_m3po_to_logits(
         raise ValueError(f"[M3PO] logits batch dim {N} != num_generations {num_generations}")
 
     if gating_function is not None:
-        # Custom gating: loop over positions (gating API expects (N, vocab_size) per position)
-        blended = logits.clone()
+        # Custom gating with gradient checkpointing to avoid storing 512 autograd nodes.
+        # Process positions in chunks; each chunk is recomputed during backward.
         thinking_mask = torch.ones(N, dtype=torch.bool, device=device)
+        CHUNK_SIZE = 32  # positions per checkpoint segment
 
-        for t in range(seq_len):
-            # Skip masked positions if mask provided
-            if completion_mask is not None and completion_mask[:, t].sum() == 0:
+        def _blend_chunk(logits_chunk, thinking_mask, lambda_blend_t):
+            """Blend a chunk of positions. Called inside grad_checkpoint so intermediates
+            are recomputed during backward instead of stored."""
+            chunk_len = logits_chunk.shape[1]
+            blended_chunk = logits_chunk.clone()
+            for t in range(chunk_len):
+                p = F.softmax(logits_chunk[:, t, :], dim=-1)
+                similarity_matrix = gating_function.compute_similarity_matrix(
+                    output_distributions=p, hidden_states=None,
+                )
+                attention_weights, _ = gating_function.compute_attention_weights(
+                    similarity_matrix=similarity_matrix,
+                    thinking_mask=thinking_mask,
+                    mask_diagonal=True,
+                )
+                contextual = torch.mm(
+                    attention_weights.to(logits_chunk.dtype),
+                    logits_chunk[:, t, :]
+                )
+                blended_chunk[:, t, :] = (1 - lambda_blend_t) * logits_chunk[:, t, :] + lambda_blend_t * contextual
+            return blended_chunk
+
+        # lambda_blend as a tensor so grad_checkpoint can track it
+        lambda_blend_t = torch.tensor(lambda_blend, device=device, dtype=logits.dtype)
+
+        blended_chunks = []
+        for start in range(0, seq_len, CHUNK_SIZE):
+            end = min(start + CHUNK_SIZE, seq_len)
+
+            # Skip fully-masked chunks
+            if completion_mask is not None and completion_mask[:, start:end].sum() == 0:
+                blended_chunks.append(logits[:, start:end, :])
                 continue
 
-            # 1. Output distributions for similarity computation
-            p = F.softmax(logits[:, t, :], dim=-1)  # (N, vocab_size)
-
-            # 2. Compute similarity matrix via gating function (differentiable)
-            similarity_matrix = gating_function.compute_similarity_matrix(
-                output_distributions=p,
-                hidden_states=None,
+            chunk = logits[:, start:end, :].contiguous()
+            blended_chunk = grad_checkpoint(
+                _blend_chunk, chunk, thinking_mask, lambda_blend_t,
+                use_reentrant=False,
             )
+            blended_chunks.append(blended_chunk)
 
-            # 3. Compute attention weights (differentiable)
-            attention_weights, _ = gating_function.compute_attention_weights(
-                similarity_matrix=similarity_matrix,
-                thinking_mask=thinking_mask,
-                mask_diagonal=True,
-            )
-
-            # 4. Blend logits: blended_i[t] = (1-λ)*logits_i[t] + λ*Σ_j A_ij*logits_j[t]
-            contextual = torch.mm(
-                attention_weights.to(logits.dtype),
-                logits[:, t, :]
-            )  # (N, vocab_size)
-            blended[:, t, :] = (1 - lambda_blend) * logits[:, t, :] + lambda_blend * contextual
+        blended = torch.cat(blended_chunks, dim=1)
 
         if debug:
             diff = (blended - logits).abs().mean().item()
