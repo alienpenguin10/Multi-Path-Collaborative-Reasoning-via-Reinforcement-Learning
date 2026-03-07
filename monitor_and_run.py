@@ -28,7 +28,7 @@ CONDA_PYTHON = os.path.expanduser("~/Neuralese/miniconda3/envs/ant/bin/python")
 TARGET_GPUS = None               # Consider all GPUs (set to list like [3, 6, 7] to restrict)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPERIMENT_SCRIPT = os.path.join(SCRIPT_DIR, "run_m3po_experiment.py")
-EXPERIMENT_ARGS = ["--gating_type", "baseline", "--trial", "1"]
+EXPERIMENT_ARGS = ["--gating_type", "luong", "--trial", "2"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 

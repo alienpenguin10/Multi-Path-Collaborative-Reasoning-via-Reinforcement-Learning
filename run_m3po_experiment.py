@@ -102,6 +102,12 @@ def build_training_config(gating_type, args):
         config["gating_config"]["init_strategy"] = args.gating_init_strategy
     if args.gating_warmup_steps > 0:
         config["gating_warmup_steps"] = args.gating_warmup_steps
+    if args.gating_warmup_min_steps is not None:
+        config["gating_warmup_min_steps"] = args.gating_warmup_min_steps
+    if args.gating_warmup_patience is not None:
+        config["gating_warmup_patience"] = args.gating_warmup_patience
+    if args.warmup_eval_interval is not None:
+        config["warmup_eval_interval"] = args.warmup_eval_interval
     if args.gating_lr is not None:
         config["gating_lr"] = args.gating_lr
     if args.gating_grad_clip is not None:
@@ -133,14 +139,15 @@ def load_model_and_tokenizer(model_name=MODEL_NAME):
     return model, tokenizer
 
 
-def prepare_data(seed, eval_size):
-    """Prepare train/eval split with deterministic seed."""
+def prepare_data(seed, eval_size, warmup_val_size=100):
+    """Prepare train/eval/warmup_val split with deterministic seed."""
     set_random_seed(seed)
     all_data = prepare_dataset("test")
     random.shuffle(all_data)
     eval_data = all_data[:eval_size]
-    train_data = all_data[eval_size:]
-    return train_data, eval_data
+    warmup_val_data = all_data[eval_size:eval_size + warmup_val_size]
+    train_data = all_data[eval_size + warmup_val_size:]
+    return train_data, eval_data, warmup_val_data
 
 
 def run_single_experiment(gating_type, trial, args):
@@ -177,8 +184,8 @@ def run_single_experiment(gating_type, trial, args):
     set_random_seed(seed)
 
     # Prepare data (same seed → same split across gating types for same trial)
-    train_data, eval_data = prepare_data(seed, args.eval_size)
-    print(f"Data prepared: {len(train_data)} train, {len(eval_data)} eval examples")
+    train_data, eval_data, warmup_val_data = prepare_data(seed, args.eval_size, args.warmup_val_size)
+    print(f"Data prepared: {len(train_data)} train, {len(eval_data)} eval, {len(warmup_val_data)} warmup_val examples")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_gpus = torch.cuda.device_count()
@@ -229,6 +236,7 @@ def run_single_experiment(gating_type, trial, args):
             train_data=train_data,
             reward_function=combined_reward,
             device_ids=device_ids,
+            warmup_val_data=warmup_val_data,
             **training_config,
         )
 
@@ -363,7 +371,11 @@ Examples:
     parser.add_argument("--seed_base", type=int, default=42, help="Base seed; trial seed = base + trial - 1 (default: 42)")
 
     # Learnable gating params (Luong/Bahdanau)
-    parser.add_argument("--gating_warmup_steps", type=int, default=0, help="Steps to train only gating params before unfreezing model (default: 0)")
+    parser.add_argument("--gating_warmup_steps", type=int, default=0, help="Max warmup steps for gating-only training (default: 0 = disabled)")
+    parser.add_argument("--gating_warmup_min_steps", type=int, default=None, help="Min warmup steps before plateau detection (default: 10)")
+    parser.add_argument("--gating_warmup_patience", type=int, default=None, help="Evals without val_acc improvement to trigger transition (default: 3)")
+    parser.add_argument("--warmup_eval_interval", type=int, default=None, help="Eval val set every N warmup steps after min_steps (default: 5)")
+    parser.add_argument("--warmup_val_size", type=int, default=100, help="Held-out validation set size for warmup plateau detection (default: 100)")
     parser.add_argument("--gating_lr", type=float, default=None, help="Learning rate for gating params (default: 100x model LR)")
     parser.add_argument("--gating_grad_clip", type=float, default=None, help="Gradient clip norm for gating params (default: 1.0)")
     parser.add_argument("--gating_rank", type=int, default=None, help="Low-rank factorization rank for Luong/Bahdanau (default: 2048)")
