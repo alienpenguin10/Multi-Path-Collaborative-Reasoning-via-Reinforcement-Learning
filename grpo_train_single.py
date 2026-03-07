@@ -667,7 +667,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
     raw_model = model.module if is_data_parallel else model
 
     # Outer loop: iterative GRPO updates.
-    for iteration in range(num_iterations):
+    try:
+      for iteration in range(num_iterations):
         print(f"\nIteration {iteration+1}/{num_iterations}")
 
         # Create a reference model (deep copy) and set it to eval mode.
@@ -857,6 +858,10 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                       f"GRPO iter {grpo_iter+1}/{mu}, loss: {step_loss:.4f}{phase_str}")
 
             step += 1
+
+    except KeyboardInterrupt:
+        print("\n\nCtrl+C detected! Stopping training early...")
+        print("Model weights will be saved and evaluation will proceed.")
 
     return raw_model
 
