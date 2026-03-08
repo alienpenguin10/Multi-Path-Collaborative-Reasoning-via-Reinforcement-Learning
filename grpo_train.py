@@ -676,7 +676,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         # print(f"[M3PO] Thinking end tokens: {thinking_end_tokens}")
 
         # generate_with_m3po handles the expansion internally
-        outputs = generate_with_m3po(
+        outputs, m3po_stats = generate_with_m3po(
             model=model,
             input_ids=prompt_ids,
             attention_mask=prompt_mask,
@@ -694,14 +694,13 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             entropy_ema_decay=entropy_ema_decay,
         )
 
-        # print("[M3PO] Generation complete")
-
         # The output already has expanded batch size (batch_size * num_generations)
         # Update prompt_ids and prompt_mask to match
         prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_mask.repeat_interleave(num_generations, dim=0)
     else:
         # Standard generation without M3PO
+        m3po_stats = {}
         prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_mask.repeat_interleave(num_generations, dim=0)
 
@@ -716,10 +715,9 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             early_stopping=False
         )
 
-    # print(f"Output batch size: {outputs.size(0)}, Device after model: {outputs.device}")
     completion_ids = outputs[:, prompt_length:]
     completion_mask = create_completion_mask(completion_ids, tokenizer.eos_token_id)
-    return prompt_ids, prompt_mask, completion_ids, completion_mask
+    return prompt_ids, prompt_mask, completion_ids, completion_mask, m3po_stats
 
 def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_generations, max_completion_length,
                           lambda_blend=None, temperature_m3po=0.1, use_m3po=True,
@@ -758,7 +756,7 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
     prompts = [sample["prompt"] if isinstance(sample, dict) else sample[0] for sample in batch_samples]
     answers = [sample["answer"] if isinstance(sample, dict) else sample[1] for sample in batch_samples]
     with torch.no_grad():
-        prompt_ids, prompt_mask, completion_ids, completion_mask = generate_completions(
+        prompt_ids, prompt_mask, completion_ids, completion_mask, m3po_stats = generate_completions(
             model, tokenizer, prompts, num_generations, max_completion_length,
             lambda_blend=lambda_blend, temperature_m3po=temperature_m3po, use_m3po=use_m3po,
             lambda_min=lambda_min, lambda_max=lambda_max, tau_H=tau_H,
@@ -783,7 +781,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         "repeated_answers": repeated_answers,
         "logits_to_keep": logits_to_keep,
         "batch_size": len(prompts),
-        "num_generations": num_generations
+        "num_generations": num_generations,
+        "m3po_stats": m3po_stats,
     }
 
 def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0.01, epsilon=0.2, verbose=False):
@@ -1047,14 +1046,18 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     optimizer.zero_grad()
 
                 # Log to wandb
-                wandb.log({
+                log_dict = {
                     "loss": loss.item(),
                     "average_reward": avg_reward,
                     "learning_rate": scheduler.get_last_lr()[0],
                     "iteration": iteration + 1,
                     "step": step + 1,
-                    "grpo_iter": grpo_iter + 1
-                })
+                    "grpo_iter": grpo_iter + 1,
+                }
+                # Add M3PO stats if available
+                if rollout_data.get("m3po_stats"):
+                    log_dict.update(rollout_data["m3po_stats"])
+                wandb.log(log_dict)
                 print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps}, "
                       f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}, "
                       f"lr: {scheduler.get_last_lr()[0]:.2e}")

@@ -296,6 +296,7 @@ def apply_m3po_step(
 
     # Process each question's paths independently
     blended_list = []
+    step_lambdas = []
     for b in range(batch_size):
         start_idx = b * N
         end_idx = (b + 1) * N
@@ -329,6 +330,12 @@ def apply_m3po_step(
             # Fallback to a reasonable default
             step_lambda = 0.1
 
+        # Track lambda values
+        if isinstance(step_lambda, torch.Tensor):
+            step_lambdas.append(step_lambda.detach())
+        else:
+            step_lambdas.append(torch.tensor([step_lambda], device=device))
+
         # Blend token embeddings
         blended = blend_token_embeddings(
             token_embeddings=batch_embeds,
@@ -342,8 +349,16 @@ def apply_m3po_step(
     # Concatenate all batches: (batch_size * N, hidden_dim)
     result = torch.cat(blended_list, dim=0)
 
+    # Collect lambda stats
+    all_lambdas = torch.cat(step_lambdas)
+    lambda_stats = {
+        "lambda_mean": all_lambdas.mean().item(),
+        "lambda_min": all_lambdas.min().item(),
+        "lambda_max": all_lambdas.max().item(),
+    }
+
     # Add sequence dimension for transformer input: (batch_size * N, 1, hidden_dim)
-    return result.unsqueeze(1)
+    return result.unsqueeze(1), lambda_stats
 
 
 @torch.no_grad()
@@ -415,6 +430,11 @@ def generate_with_m3po(
         mode = "adaptive" if lambda_blend is None else f"fixed={lambda_blend}"
         print(f"[M3PO GEN v2] Starting: batch={batch_size}, N={num_generations}, total={total_paths}, lambda={mode}")
 
+    # Collect lambda stats across all generation steps
+    all_step_lambda_means = []
+    all_step_lambda_mins = []
+    all_step_lambda_maxs = []
+
     for step in range(max_new_tokens):
         # Forward pass with embeddings
         outputs = model(
@@ -453,7 +473,7 @@ def generate_with_m3po(
         # Adaptive mode (lambda_blend is None) always enters; fixed mode checks lambda > 0
         if any(thinking_mask) and (lambda_blend is None or lambda_blend > 0):
             # Compute attention from output distributions
-            blended_embeds = apply_m3po_step(
+            blended_embeds, lambda_stats = apply_m3po_step(
                 logits=logits,  # Original logits for similarity
                 embed_tokens=embed_tokens,
                 sampled_tokens=next_tokens,
@@ -462,6 +482,9 @@ def generate_with_m3po(
                 entropy_tracker=entropy_tracker,
             )
             # Shape: (total_paths, 1, hidden_dim)
+            all_step_lambda_means.append(lambda_stats["lambda_mean"])
+            all_step_lambda_mins.append(lambda_stats["lambda_min"])
+            all_step_lambda_maxs.append(lambda_stats["lambda_max"])
         else:
             blended_embeds = next_embeds.unsqueeze(1)
 
@@ -486,7 +509,17 @@ def generate_with_m3po(
             active = sum(thinking_mask)
             print(f"[M3PO GEN v2] Step {step}: {active}/{total_paths} thinking, seq_len={inputs_embeds.shape[1]}")
 
-    return generated_ids
+    # Aggregate lambda stats across all generation steps
+    m3po_stats = {}
+    if all_step_lambda_means:
+        m3po_stats = {
+            "m3po/lambda_mean": sum(all_step_lambda_means) / len(all_step_lambda_means),
+            "m3po/lambda_min": min(all_step_lambda_mins),
+            "m3po/lambda_max": max(all_step_lambda_maxs),
+            "m3po/active_steps": len(all_step_lambda_means),
+        }
+
+    return generated_ids, m3po_stats
 
 
 __all__ = [
