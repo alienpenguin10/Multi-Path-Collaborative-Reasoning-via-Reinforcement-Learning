@@ -216,31 +216,19 @@ def extract_single_number(text):
    numbers = re.findall(r'-?\d*\.?\d+', text)
    return float(numbers[0]) if len(numbers) == 1 else None
 
-def evaluate_model(model, tokenizer, eval_examples, device):
+def evaluate_model(model, tokenizer, eval_examples, device, eval_batch_size=8):
    """
-   Evaluates the model on a set of examples and prints detailed results.
+   Evaluates the model on a set of examples using batched inference.
 
    Args:
        model: The language model to evaluate.
        tokenizer: The tokenizer for encoding inputs and decoding outputs.
        eval_examples (list): List of evaluation examples, each containing "prompt" and "answer".
        device: The device (CPU or GPU) to run evaluation on.
+       eval_batch_size (int): Number of examples to process per batch.
 
    Returns:
        float: The accuracy percentage (correct predictions / total examples * 100).
-
-   Explanation:
-       1. Sets the model to evaluation mode.
-       2. For each example in the evaluation set:
-          - Encodes the prompt and generates a response using the model.
-          - Extracts the predicted answer from the generated response.
-          - Compares the predicted answer with the expected answer using multiple methods:
-            a. Exact string matching
-            b. Single number extraction and comparison
-            c. Last number extraction and comparison
-          - Prints detailed information about each example.
-       3. Calculates and returns the overall accuracy.
-       4. Returns the model to training mode.
    """
    model.eval()
    correct = 0
@@ -249,16 +237,22 @@ def evaluate_model(model, tokenizer, eval_examples, device):
    print("EVALUATION ON", total, "EXAMPLES")
    print("="*50)
 
-   for example in eval_examples:
-       # Get the prompt and expected answer
-       full_prompt = example["prompt"]
-       expected = example["answer"]
+   for batch_start in range(0, total, eval_batch_size):
+       batch = eval_examples[batch_start:batch_start + eval_batch_size]
+       prompts = [ex["prompt"] for ex in batch]
+       expected_answers = [ex["answer"] for ex in batch]
 
-       # Tokenize and generate response
-       inputs = tokenizer.encode(full_prompt, return_tensors="pt").to(device)
+       # Tokenize batch with left-padding for generation
+       encoded = tokenizer(
+           prompts,
+           return_tensors="pt",
+           padding=True,
+           truncation=True,
+       ).to(device)
+
        with torch.no_grad():
            outputs = model.generate(
-               inputs,
+               **encoded,
                max_new_tokens=512,
                temperature=0.7,
                num_return_sequences=1,
@@ -267,56 +261,40 @@ def evaluate_model(model, tokenizer, eval_examples, device):
                forced_eos_token_id=tokenizer.eos_token_id,
                early_stopping=False,
            )
-       response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-       try:
-           # Extract answer and check correctness
-           predicted = extract_answer_from_model_output(response)
+       # Decode each response in the batch
+       for i, (output_ids, expected) in enumerate(zip(outputs, expected_answers)):
+           response = tokenizer.decode(output_ids, skip_special_tokens=True)
+           try:
+               predicted = extract_answer_from_model_output(response)
 
-           # Try different matching methods
-           if predicted == expected:  # Exact match
-               is_correct = True
-           else:
-               # Try single number matching
-               pred_num = extract_single_number(str(predicted))
-               exp_num = extract_single_number(str(expected))
-               if pred_num is not None and exp_num is not None and pred_num == exp_num:
+               if predicted == expected:
                    is_correct = True
                else:
-                   # Try last number matching
-                   pred_num = extract_last_number(str(predicted))
-                   exp_num = extract_last_number(str(expected))
-                   is_correct = (pred_num is not None and exp_num is not None and
-                               pred_num == exp_num)
+                   pred_num = extract_single_number(str(predicted))
+                   exp_num = extract_single_number(str(expected))
+                   if pred_num is not None and exp_num is not None and pred_num == exp_num:
+                       is_correct = True
+                   else:
+                       pred_num = extract_last_number(str(predicted))
+                       exp_num = extract_last_number(str(expected))
+                       is_correct = (pred_num is not None and exp_num is not None and
+                                   pred_num == exp_num)
 
-           # Update counter for correct answers
-           if is_correct:
-               correct += 1
+               if is_correct:
+                   correct += 1
 
-           # Print evaluation details
-        #    print("\nPrompt:")
-        #    print(full_prompt)
-        #    print("\nExpected Answer:")
-        #    print(expected)
-        #    print("\nExtracted Answer:")
-        #    print(predicted)
-        #    print("\nFull Generated Response:")
-        #    print(response)
-           print("\nCorrect:", "✓" if is_correct else "✗")
-        #    print("-"*50)
+               print("\nCorrect:", "✓" if is_correct else "✗")
 
-       except Exception as e:
-           print("\nFailed to parse model output for prompt:")
-           print(full_prompt)
-           print("Error:", e)
-           print("-"*50)
+           except Exception as e:
+               print(f"\nFailed to parse model output: {e}")
 
-   # Calculate and print final accuracy
+       print(f"  Progress: {min(batch_start + eval_batch_size, total)}/{total}")
+
    accuracy = (correct / total) * 100
-   # print(f"\nAccuracy: {accuracy:.2f}% ({correct}/{total})")
-   # print("="*50)
+   print(f"\nAccuracy: {accuracy:.2f}% ({correct}/{total})")
+   print("="*50)
 
-   # Return model to training mode
    model.train()
    return accuracy
 
@@ -1158,12 +1136,12 @@ if __name__ == "__main__":
     training_config = {
         'num_iterations': 1,
         'num_steps': 500,                  # Full training: ~500 steps (500 * 5 batch = 2500 examples per iteration)
-        'batch_size': 2,                   # Reduced for single GPU (was 5 for multi-GPU)
-        'num_generations': 4,              # Paper uses 4 or 8 (using 4 for faster output)
+        'batch_size': 4,                   # 4 prompts per step (effective 16 with grad accum)
+        'num_generations': 4,              # Paper uses 8 for GSM8k
         'max_completion_length': 400,      # Reduced for single GPU (was 512 for multi-GPU)
         'beta': 0.005,                     # Paper value (KL penalty coefficient)
         'learning_rate': 5e-6,             # Paper value
-        'mu': 1,
+        'mu': 2,                           # 2 gradient updates per rollout
         'epsilon': 0.1,
         # M3PO-specific parameters (from paper Table 3)
         'lambda_blend': None,              # None = adaptive entropy-gated, 0.1 = fixed (original)
