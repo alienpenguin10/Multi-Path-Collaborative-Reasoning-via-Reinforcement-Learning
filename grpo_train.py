@@ -990,7 +990,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         )
 
         # Cosine LR scheduler with warmup (Paper Table 3)
-        total_training_steps = num_steps * mu
+        num_steps_epoch = len(train_data) // batch_size
+        total_training_steps = num_steps_epoch * mu
         warmup_steps = int(total_training_steps * warmup_ratio)
 
         def lr_lambda(current_step):
@@ -1003,10 +1004,14 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         model.train()
 
         # Inner loop: training steps with gradient accumulation.
+        # Shuffle dataset and iterate sequentially so every question is seen exactly once.
+        shuffled_data = train_data.copy()
+        random.shuffle(shuffled_data)
+        num_steps_actual = len(shuffled_data) // batch_size
         optimizer.zero_grad()
         accum_count = 0
-        for step in range(num_steps):
-            batch_samples = random.sample(train_data, batch_size)
+        for step in range(num_steps_actual):
+            batch_samples = shuffled_data[step * batch_size : (step + 1) * batch_size]
             with torch.no_grad():
                 rollout_data = generate_rollout_data(
                     raw_model,
@@ -1061,7 +1066,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 if rollout_data.get("m3po_stats"):
                     log_dict.update(rollout_data["m3po_stats"])
                 wandb.log(log_dict)
-                print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps}, "
+                print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps_actual}, "
                       f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}, "
                       f"lr: {scheduler.get_last_lr()[0]:.2e}")
     return raw_model
@@ -1106,8 +1111,10 @@ if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using primary device: {device}")
 
+    experiment = "M3PO"  # Change this to save models, wandb runs, and HF repos under a different name
+
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    output_dir = "grpo_finetuned_model"
+    output_dir = f"{experiment}_finetuned_model"
 
     # Load from checkpoint if available, otherwise from base model
     load_path = output_dir if os.path.isdir(output_dir) else model_name
@@ -1143,7 +1150,7 @@ if __name__ == "__main__":
     # Tested on 8xA100 node with 80GB VRAM each
     training_config = {
         'num_iterations': 1,
-        'num_steps': 500,                  # Full training: ~500 steps (500 * 5 batch = 2500 examples per iteration)
+        # num_steps is now computed automatically from dataset size: len(train_data) // batch_size
         'batch_size': 4,                   # 4 prompts per step (effective 16 with grad accum)
         'num_generations': 4,              # Paper uses 8 for GSM8k
         'max_completion_length': 400,      # Reduced for single GPU (was 512 for multi-GPU)
@@ -1152,7 +1159,7 @@ if __name__ == "__main__":
         'mu': 2,                           # 2 gradient updates per rollout
         'epsilon': 0.1,
         # M3PO-specific parameters (from paper Table 3)
-        'lambda_blend': None,              # None = adaptive entropy-gated, 0.1 = fixed (original)
+        'lambda_blend': 0.1,              # None = adaptive entropy-gated, 0.1 = fixed (original)
         'lambda_min': 0.01,                # Minimum adaptive lambda
         'lambda_max': 0.3,                 # Maximum adaptive lambda
         'tau_H': 1.0,                      # Entropy normalization temperature
@@ -1164,7 +1171,7 @@ if __name__ == "__main__":
     }
 
     # Initialize Weights & Biases
-    wandb.init(project=os.environ.get("WANDB_PROJECT", "M3PO"), name="M3PO", reinit=True)
+    wandb.init(project=os.environ.get("WANDB_PROJECT", "M3PO"), name=experiment, reinit=True)
     print("Weights & Biases initialized.")
 
     model = train_with_grpo(
@@ -1187,13 +1194,14 @@ if __name__ == "__main__":
     model_to_save = model.module if hasattr(model, 'module') else model
 
     print("\nSaving GRPO fine-tuned model...")
-    model_to_save.save_pretrained("grpo_finetuned_model")
-    tokenizer.save_pretrained("grpo_finetuned_model")
+    model_to_save.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
     # # Push to Hugging Face Hub
     print("\nPushing model to Hugging Face Hub...")
     from huggingface_hub import login
     login(token=os.environ["HF_TOKEN"])
-    model_to_save.push_to_hub("Alienpenguin10/M3PO")
-    tokenizer.push_to_hub("Alienpenguin10/M3PO")
-    print("Model pushed to Hugging Face Hub: Alienpenguin10/M3PO")
+    hf_repo = f"Alienpenguin10/{experiment}"
+    model_to_save.push_to_hub(hf_repo)
+    tokenizer.push_to_hub(hf_repo)
+    print(f"Model pushed to Hugging Face Hub: {hf_repo}")
