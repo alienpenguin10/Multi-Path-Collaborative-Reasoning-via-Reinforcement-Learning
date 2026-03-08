@@ -15,6 +15,9 @@ import bitsandbytes as bnb
 import math
 
 # Hugging Face libraries for transformer models
+import sys
+sys.path.insert(0, os.path.abspath("transformers/src"))
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
@@ -58,9 +61,9 @@ def set_random_seed(seed: int = 42):
 # Call the function to set random seed for reproducibility
 set_random_seed(42)
 
-# Set environment variables for Weights & Biases (wandb) logging
-os.environ["WANDB_API_KEY"] = "dea7d241b4217750d3ee58eaec94c6f9349727fb"
-os.environ["WANDB_PROJECT"] = "latent-space-reasoning"
+# Load environment variables from .env file (wandb, HF token, etc.)
+from dotenv import load_dotenv
+load_dotenv()
 
 
 SYSTEM_PROMPT = """
@@ -1180,14 +1183,17 @@ if __name__ == "__main__":
     post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
+    # Unwrap DataParallel if needed
+    model_to_save = model.module if hasattr(model, 'module') else model
+
     print("\nSaving GRPO fine-tuned model...")
-    model.save_pretrained("grpo_finetuned_model")
+    model_to_save.save_pretrained("grpo_finetuned_model")
     tokenizer.save_pretrained("grpo_finetuned_model")
 
     # # Push to Hugging Face Hub
     print("\nPushing model to Hugging Face Hub...")
     from huggingface_hub import login
-    login(token="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")
-    model.push_to_hub("Alienpenguin10/M3PO")
+    login(token=os.environ["HF_TOKEN"])
+    model_to_save.push_to_hub("Alienpenguin10/M3PO")
     tokenizer.push_to_hub("Alienpenguin10/M3PO")
     print("Model pushed to Hugging Face Hub: Alienpenguin10/M3PO")
