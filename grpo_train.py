@@ -11,6 +11,8 @@ import wandb
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+import bitsandbytes as bnb
+import math
 
 # Hugging Face libraries for transformer models
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -927,7 +929,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                               num_generations=4, max_completion_length=128, beta=0.1,
                               learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None, device_ids=None,
                               lambda_blend=None, temperature_m3po=0.1, use_m3po=True,
-                              lambda_min=0.01, lambda_max=0.3, tau_H=1.0, entropy_ema_decay=0.95):
+                              lambda_min=0.01, lambda_max=0.3, tau_H=1.0, entropy_ema_decay=0.95,
+                              gradient_accumulation_steps=1, warmup_ratio=0.1):
     """
     Train with GRPO + M3PO (Multi-Path Perception Policy Optimization).
 
@@ -998,16 +1001,30 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         # print("Reference model created.")
 
         # Reinitialize the optimizer for this iteration with M3PO paper parameters.
-        # Paper Table 3: weight_decay=0.1, betas=(0.9, 0.99)
-        optimizer = torch.optim.AdamW(
+        # Paper Table 3: AdamW 8bit, weight_decay=0.1, betas=(0.9, 0.99)
+        optimizer = bnb.optim.AdamW8bit(
             model.parameters(),
             lr=learning_rate,
             weight_decay=0.1,
             betas=(0.9, 0.99)
         )
+
+        # Cosine LR scheduler with warmup (Paper Table 3)
+        total_training_steps = num_steps * mu
+        warmup_steps = int(total_training_steps * warmup_ratio)
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            progress = (current_step - warmup_steps) / max(1, total_training_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         model.train()
 
-        # Inner loop: your original training steps.
+        # Inner loop: training steps with gradient accumulation.
+        optimizer.zero_grad()
+        accum_count = 0
         for step in range(num_steps):
             batch_samples = random.sample(train_data, batch_size)
             with torch.no_grad():
@@ -1040,24 +1057,29 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     epsilon=epsilon,
                     verbose=verbose_output
                 )
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-                optimizer.step()
+                # Scale loss for gradient accumulation
+                scaled_loss = loss / gradient_accumulation_steps
+                scaled_loss.backward()
+                accum_count += 1
+
+                if accum_count % gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
                 # Log to wandb
                 wandb.log({
                     "loss": loss.item(),
                     "average_reward": avg_reward,
+                    "learning_rate": scheduler.get_last_lr()[0],
                     "iteration": iteration + 1,
                     "step": step + 1,
                     "grpo_iter": grpo_iter + 1
                 })
                 print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps}, "
-                      f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}")
-                #for i in range(torch.cuda.device_count()):
-                #    print(f"GPU {i} Usage: {torch.cuda.memory_allocated(i) / 1024**2:.2f} MiB, "
-                #          f"Utilization: {torch.cuda.utilization(i)}%")
-                # Uncomment to see the GPU utilization stats
+                      f"GRPO iter {grpo_iter+1}/{mu}, loss: {loss.item():.4f}, "
+                      f"lr: {scheduler.get_last_lr()[0]:.2e}")
     return raw_model
 
 def optimize_model_memory(model):
@@ -1120,11 +1142,9 @@ if __name__ == "__main__":
     print(f"Detected {num_gpus} GPUs")
     device_ids = list(range(num_gpus)) if num_gpus > 1 else None
 
-    all_data = prepare_dataset("test")
-    random.shuffle(all_data)
-    size_of_eval_data = 30 # change to a smaller value to save time or to a larger number for a more reliable estimate
-    eval_data = all_data[:size_of_eval_data]
-    train_data = all_data[size_of_eval_data:]  # Use all remaining data for training (~7400 examples)
+    train_data = prepare_dataset("train")   # GSM8K train split (~7473 examples)
+    random.shuffle(train_data)
+    eval_data = prepare_dataset("test")     # GSM8K test split (~1319 examples)
 
     # print("\nInitial model evaluation before finetuning:")
     # pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
@@ -1153,31 +1173,33 @@ if __name__ == "__main__":
         'entropy_ema_decay': 0.95,         # EMA decay for entropy statistics
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
+        'gradient_accumulation_steps': 4,  # Paper Table 3
+        'warmup_ratio': 0.1,              # Paper Table 3: cosine schedule with warmup
     }
 
     # Initialize Weights & Biases
-    # wandb.init(project=os.environ["WANDB_PROJECT"], name="M3PO", reinit=True)
-    # print("Weights & Biases initialized.")
+    wandb.init(project=os.environ.get("WANDB_PROJECT", "M3PO"), name="M3PO", reinit=True)
+    print("Weights & Biases initialized.")
 
-    # model = train_with_grpo(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     train_data=train_data,
-    #     reward_function=combined_reward,
-    #     device_ids=device_ids,
-    #     **training_config
-    # )
+    model = train_with_grpo(
+        model=model,
+        tokenizer=tokenizer,
+        train_data=train_data,
+        reward_function=combined_reward,
+        device_ids=device_ids,
+        **training_config
+    )
 
-    # wandb.finish()
-    # print("Training completed and wandb run finished.")
+    wandb.finish()
+    print("Training completed and wandb run finished.")
 
     print("\nFinal model evaluation after GRPO RL fine-tuning:")
     post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
-    # print("\nSaving GRPO fine-tuned model...")
-    # model.save_pretrained("grpo_finetuned_model")
-    # tokenizer.save_pretrained("grpo_finetuned_model")
+    print("\nSaving GRPO fine-tuned model...")
+    model.save_pretrained("grpo_finetuned_model")
+    tokenizer.save_pretrained("grpo_finetuned_model")
 
     # # Push to Hugging Face Hub
     # print("\nPushing model to Hugging Face Hub...")
