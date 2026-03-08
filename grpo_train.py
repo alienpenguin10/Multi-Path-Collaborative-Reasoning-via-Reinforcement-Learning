@@ -1101,17 +1101,19 @@ if __name__ == "__main__":
     print(f"Using primary device: {device}")
 
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    output_dir = "math_solver_model"
+    output_dir = "grpo_finetuned_model"
 
-    print("Loading fine-tuned model from grpo_finetuned_model...")
+    # Load from checkpoint if available, otherwise from base model
+    load_path = output_dir if os.path.isdir(output_dir) else model_name
+    print(f"Loading model from {load_path}...")
     model = AutoModelForCausalLM.from_pretrained(
-        "grpo_finetuned_model",
+        load_path,
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
-    print("Fine-tuned model loaded")
+    print("Model loaded")
 
-    tokenizer = AutoTokenizer.from_pretrained("grpo_finetuned_model", padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(load_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
     model.config.pad_token_id = tokenizer.eos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -1180,9 +1182,9 @@ if __name__ == "__main__":
     tokenizer.save_pretrained("grpo_finetuned_model")
 
     # # Push to Hugging Face Hub
-    # print("\nPushing model to Hugging Face Hub...")
-    # from huggingface_hub import login
-    # login(token="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")
-    # model.push_to_hub("Alienpenguin10/M3PO")
-    # tokenizer.push_to_hub("Alienpenguin10/M3PO")
-    # print("Model pushed to Hugging Face Hub: Alienpenguin10/M3PO")
+    print("\nPushing model to Hugging Face Hub...")
+    from huggingface_hub import login
+    login(token="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")
+    model.push_to_hub("Alienpenguin10/M3PO")
+    tokenizer.push_to_hub("Alienpenguin10/M3PO")
+    print("Model pushed to Hugging Face Hub: Alienpenguin10/M3PO")
