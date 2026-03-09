@@ -1045,7 +1045,7 @@ if __name__ == "__main__":
         'max_completion_length': 400,      # Reduced for 1x A100 40GB
         'beta': 0.005,                     # Paper value (KL penalty coefficient)
         'learning_rate': 5e-6,             # Paper value
-        'mu': 2,
+        'mu': 3,
         'epsilon': 0.1,
         'gradient_accumulation_steps': 4,  # Paper Table 3
         'warmup_ratio': 0.1,              # Paper Table 3: cosine schedule with warmup
