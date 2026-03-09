@@ -719,17 +719,9 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 )
         model.train()
 
-        # Cosine LR scheduler with warmup (Paper Table 3)
-        total_training_steps = num_steps * mu
-        lr_warmup_steps = int(total_training_steps * warmup_ratio)
-
-        def lr_lambda(current_step):
-            if current_step < lr_warmup_steps:
-                return current_step / max(1, lr_warmup_steps)
-            progress = (current_step - lr_warmup_steps) / max(1, total_training_steps - lr_warmup_steps)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # Fixed LR — cosine decay was causing LR to be well below 5e-6 for most of training.
+        # For RL/GRPO, fixed LR works better since the reward landscape keeps shifting.
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
 
         in_warmup_phase = has_learnable_gating and gating_warmup_steps > 0
         total_steps = num_steps + (gating_warmup_steps if in_warmup_phase else 0)
@@ -753,7 +745,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
-                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
                 optimizer.zero_grad()
                 accum_count = 0
 
