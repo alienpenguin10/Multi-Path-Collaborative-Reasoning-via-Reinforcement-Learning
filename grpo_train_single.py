@@ -711,24 +711,25 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             effective_gating_lr = gating_lr if gating_lr is not None else learning_rate * 100
             effective_gating_grad_clip = gating_grad_clip if gating_grad_clip is not None else 1.0
 
-        if has_learnable_gating and gating_warmup_steps > 0:
-            # Phase 1: freeze model, train only gating params
-            for param in model.parameters():
-                param.requires_grad = False
-            optimizer = torch.optim.AdamW(
-                list(gating_function.parameters()),
-                lr=effective_gating_lr,
-                weight_decay=0.1,
-                betas=(0.9, 0.99),
-            )
-            print(f"[M3PO] Phase 1 (warmup): training only gating params for up to {gating_warmup_steps} steps at lr={effective_gating_lr}")
-            if warmup_val_data is not None:
-                print(f"[M3PO] Validation-based plateau: {len(warmup_val_data)} val examples, eval every {warmup_eval_interval} steps, "
-                      f"min_steps={gating_warmup_min_steps}, patience={gating_warmup_patience}")
-            else:
-                print(f"[M3PO] Training loss plateau: min_steps={gating_warmup_min_steps}, patience={gating_warmup_patience}")
-        else:
-            # Standard optimizer (no warmup or no learnable gating)
+        # Gating warmup system commented out — not needed right now
+        # if has_learnable_gating and gating_warmup_steps > 0:
+        #     # Phase 1: freeze model, train only gating params
+        #     for param in model.parameters():
+        #         param.requires_grad = False
+        #     optimizer = torch.optim.AdamW(
+        #         list(gating_function.parameters()),
+        #         lr=effective_gating_lr,
+        #         weight_decay=0.1,
+        #         betas=(0.9, 0.99),
+        #     )
+        #     print(f"[M3PO] Phase 1 (warmup): training only gating params for up to {gating_warmup_steps} steps at lr={effective_gating_lr}")
+        #     if warmup_val_data is not None:
+        #         print(f"[M3PO] Validation-based plateau: {len(warmup_val_data)} val examples, eval every {warmup_eval_interval} steps, "
+        #               f"min_steps={gating_warmup_min_steps}, patience={gating_warmup_patience}")
+        #     else:
+        #         print(f"[M3PO] Training loss plateau: min_steps={gating_warmup_min_steps}, patience={gating_warmup_patience}")
+        if True:
+            # Standard optimizer (no warmup)
             if has_learnable_gating:
                 optimizer = bnb.optim.AdamW8bit(
                     [
@@ -761,38 +762,38 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         model.train()
 
-        # Warmup plateau detection state
-        in_warmup_phase = has_learnable_gating and gating_warmup_steps > 0
-        warmup_best_val_acc = -1.0
-        warmup_evals_without_improvement = 0
-        warmup_steps_used = 0
+        # Warmup plateau detection state — commented out, not needed right now
+        in_warmup_phase = False
+        # warmup_best_val_acc = -1.0
+        # warmup_evals_without_improvement = 0
+        # warmup_steps_used = 0
 
-        def _transition_to_phase2(step_num, reason):
-            """Unfreeze model and create joint optimizer."""
-            nonlocal in_warmup_phase, warmup_steps_used
-            warmup_steps_used = step_num
-            print(f"[M3PO] Phase 2 at step {step_num + 1} ({reason}): unfreezing model, "
-                  f"adding {warmup_steps_used} extra steps to compensate")
-            in_warmup_phase = False
-            for param in model.parameters():
-                param.requires_grad = True
-            return bnb.optim.AdamW8bit(
-                [
-                    {"params": list(model.parameters()), "lr": learning_rate},
-                    {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
-                ],
-                weight_decay=0.1,
-                betas=(0.9, 0.99),
-            )
+        # def _transition_to_phase2(step_num, reason):
+        #     """Unfreeze model and create joint optimizer."""
+        #     nonlocal in_warmup_phase, warmup_steps_used
+        #     warmup_steps_used = step_num
+        #     print(f"[M3PO] Phase 2 at step {step_num + 1} ({reason}): unfreezing model, "
+        #           f"adding {warmup_steps_used} extra steps to compensate")
+        #     in_warmup_phase = False
+        #     for param in model.parameters():
+        #         param.requires_grad = True
+        #     return bnb.optim.AdamW8bit(
+        #         [
+        #             {"params": list(model.parameters()), "lr": learning_rate},
+        #             {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
+        #         ],
+        #         weight_decay=0.1,
+        #         betas=(0.9, 0.99),
+        #     )
 
-        def _run_warmup_eval(step_num):
-            """Run validation eval during warmup. Returns accuracy."""
-            model.eval()
-            val_acc = evaluate_model(raw_model, tokenizer, warmup_val_data, device)
-            model.train()
-            print(f"[M3PO] Warmup eval at step {step_num + 1}: val_acc={val_acc:.2f}%")
-            wandb.log({"m3po/warmup_val_acc": val_acc, "step": step_num + 1})
-            return val_acc
+        # def _run_warmup_eval(step_num):
+        #     """Run validation eval during warmup. Returns accuracy."""
+        #     model.eval()
+        #     val_acc = evaluate_model(raw_model, tokenizer, warmup_val_data, device)
+        #     model.train()
+        #     print(f"[M3PO] Warmup eval at step {step_num + 1}: val_acc={val_acc:.2f}%")
+        #     wandb.log({"m3po/warmup_val_acc": val_acc, "step": step_num + 1})
+        #     return val_acc
 
         # Inner loop: training steps with gradient accumulation.
         # Shuffle dataset and iterate sequentially so every question is seen exactly once.
@@ -804,9 +805,9 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
 
         step = 0
         for step in range(num_steps_actual):
-            # Phase transition: hard cap on warmup steps
-            if in_warmup_phase and step == gating_warmup_steps:
-                optimizer = _transition_to_phase2(step, f"reached max {gating_warmup_steps} steps")
+            # Phase transition: hard cap on warmup steps — commented out
+            # if in_warmup_phase and step == gating_warmup_steps:
+            #     optimizer = _transition_to_phase2(step, f"reached max {gating_warmup_steps} steps")
 
             batch_samples = shuffled_data[step * batch_size : (step + 1) * batch_size]
             with torch.no_grad():
@@ -850,8 +851,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 if accum_count % gradient_accumulation_steps == 0:
                     # Separate gradient clipping for model and gating params
                     if has_learnable_gating:
-                        if not in_warmup_phase:
-                            torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
+                        torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
                         torch.nn.utils.clip_grad_norm_(list(gating_function.parameters()), max_norm=effective_gating_grad_clip)
                     else:
                         torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
@@ -861,28 +861,28 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
 
                 step_loss = loss.item()
 
-                # Validation-based plateau detection during warmup
-                if in_warmup_phase and grpo_iter == mu - 1:
-                    should_eval = (
-                        warmup_val_data is not None
-                        and step >= gating_warmup_min_steps
-                        and (step - gating_warmup_min_steps) % warmup_eval_interval == 0
-                    )
-                    if should_eval:
-                        val_acc = _run_warmup_eval(step)
-                        if val_acc > warmup_best_val_acc:
-                            warmup_best_val_acc = val_acc
-                            warmup_evals_without_improvement = 0
-                        else:
-                            warmup_evals_without_improvement += 1
-
-                        if warmup_evals_without_improvement >= gating_warmup_patience:
-                            optimizer = _transition_to_phase2(
-                                step,
-                                f"val_acc plateaued at {warmup_best_val_acc:.2f}% for "
-                                f"{gating_warmup_patience} evals"
-                            )
-                            total_steps = num_steps + warmup_steps_used
+                # Validation-based plateau detection during warmup — commented out
+                # if in_warmup_phase and grpo_iter == mu - 1:
+                #     should_eval = (
+                #         warmup_val_data is not None
+                #         and step >= gating_warmup_min_steps
+                #         and (step - gating_warmup_min_steps) % warmup_eval_interval == 0
+                #     )
+                #     if should_eval:
+                #         val_acc = _run_warmup_eval(step)
+                #         if val_acc > warmup_best_val_acc:
+                #             warmup_best_val_acc = val_acc
+                #             warmup_evals_without_improvement = 0
+                #         else:
+                #             warmup_evals_without_improvement += 1
+                #
+                #         if warmup_evals_without_improvement >= gating_warmup_patience:
+                #             optimizer = _transition_to_phase2(
+                #                 step,
+                #                 f"val_acc plateaued at {warmup_best_val_acc:.2f}% for "
+                #                 f"{gating_warmup_patience} evals"
+                #             )
+                #             total_steps = num_steps + warmup_steps_used
 
                 # Log to wandb
                 log_dict = {
@@ -902,17 +902,16 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                         p.grad.norm().item() ** 2 for p in gating_function.parameters() if p.grad is not None
                     ) ** 0.5
                     log_dict["m3po/gating_grad_norm"] = gating_grad_norm
-                    log_dict["m3po/in_warmup_phase"] = 1.0 if in_warmup_phase else 0.0
+                    # log_dict["m3po/in_warmup_phase"] = 1.0 if in_warmup_phase else 0.0
                 if gating_function is not None:
                     stats = gating_function.get_stats_summary()
                     for key, value in stats.items():
                         log_dict[f"m3po/{key}"] = value
                     gating_function.reset_stats()
                 wandb.log(log_dict)
-                phase_str = ' [warmup]' if in_warmup_phase else ''
                 print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps_actual}, "
                       f"GRPO iter {grpo_iter+1}/{mu}, loss: {step_loss:.4f}, "
-                      f"lr: {scheduler.get_last_lr()[0]:.2e}{phase_str}")
+                      f"lr: {scheduler.get_last_lr()[0]:.2e}")
 
     except KeyboardInterrupt:
         print("\n\nCtrl+C detected! Stopping training early...")
@@ -1066,10 +1065,11 @@ if __name__ == "__main__":
             'init_strategy': 'identity',   # 'identity' (QR-based) or 'xavier'
             'debug': False,                # Enable debug logging
         },
-        'gating_warmup_steps': 50,         # Max warmup steps (hard cap)
-        'gating_warmup_min_steps': 10,     # Min steps before validation-based plateau detection
-        'gating_warmup_patience': 3,       # Evals without val_acc improvement to trigger transition
-        'warmup_eval_interval': 5,         # Eval on val set every N warmup steps (after min_steps)
+        # Gating warmup system — commented out, not needed right now
+        'gating_warmup_steps': 0,          # Disabled (was 50)
+        # 'gating_warmup_min_steps': 10,   # Min steps before validation-based plateau detection
+        # 'gating_warmup_patience': 3,     # Evals without val_acc improvement to trigger transition
+        # 'warmup_eval_interval': 5,       # Eval on val set every N warmup steps (after min_steps)
         'gating_lr': 5e-4,                 # 100x model LR for randomly-initialized gating params
         'gating_grad_clip': 1.0,           # Separate grad clip for gating (10x less aggressive)
     }
