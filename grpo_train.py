@@ -623,9 +623,9 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 ii. Updates the policy model using gradient descent.
            - Monitors GPU memory usage and prints progress information.
     """
-    assert device_ids is not None and len(device_ids) > 1, "This code needs at least 2 GPU cores to run!"
-
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    use_data_parallel = device_ids is not None and len(device_ids) > 1
 
     if use_m3po:
         print(f"[M3PO] Training with cross-path interaction: lambda={lambda_blend}, temp={temperature_m3po}")
@@ -649,16 +649,19 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             gating_function = None
 
     # Wrap model with DataParallel if multiple GPUs are available.
-
-    model = nn.DataParallel(model, device_ids=device_ids)
-    print(f"Model wrapped with DataParallel across GPUs: {device_ids}")
+    if use_data_parallel:
+        model = nn.DataParallel(model, device_ids=device_ids)
+        print(f"Model wrapped with DataParallel across GPUs: {device_ids}")
+    else:
+        print(f"Running on single device: {device}")
 
     # Outer loop: iterative GRPO updates.
     for iteration in range(num_iterations):
         print(f"\nIteration {iteration+1}/{num_iterations}")
 
         # Create a reference model (deep copy) and set it to eval mode.
-        ref_model = copy.deepcopy(model.module)
+        base_model = model.module if use_data_parallel else model
+        ref_model = copy.deepcopy(base_model)
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
@@ -683,7 +686,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             batch_samples = random.sample(train_data, batch_size)
             with torch.no_grad():
                 rollout_data = generate_rollout_data(
-                    model.module,
+                    base_model,
                     ref_model,
                     tokenizer,
                     batch_samples,
@@ -699,7 +702,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 # verbose_output = (step == 0 and grpo_iter == 0)
                 verbose_output = False  # Disabled for full training
                 loss, avg_reward = grpo_loss(
-                    model.module,
+                    base_model,
                     ref_model,
                     rollout_data,
                     tokenizer,
@@ -739,7 +742,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 #    print(f"GPU {i} Usage: {torch.cuda.memory_allocated(i) / 1024**2:.2f} MiB, "
                 #          f"Utilization: {torch.cuda.utilization(i)}%")
                 # Uncomment to see the GPU utilization stats
-    return model.module
+    return base_model
 
 """
 Part 7: Training Setup and Execution
@@ -811,13 +814,14 @@ if __name__ == "__main__":
 
     num_gpus = torch.cuda.device_count()
     print(f"Detected {num_gpus} GPUs")
-    device_ids = list(range(num_gpus)) if num_gpus > 1 else None
+    device_ids = list(range(num_gpus)) if num_gpus > 1 else [0]
 
-    all_data = prepare_dataset("test")
-    random.shuffle(all_data)
+    train_data = prepare_dataset("train")
+    test_data = prepare_dataset("test")
+    random.shuffle(train_data)
     size_of_eval_data = 30 # change to a smaller value to save time or to a larger number for a more reliable estimate
-    eval_data = all_data[:size_of_eval_data]
-    train_data = all_data[size_of_eval_data:]  # Use all remaining data for training (~7400 examples)
+    eval_data = train_data
+    train_data = test_data  # Use all remaining data for training (~7400 examples)
 
     # print("\nInitial model evaluation before finetuning:")
     # pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
@@ -830,7 +834,7 @@ if __name__ == "__main__":
     # Tested on 8xA100 node with 80GB VRAM each
     training_config = {
         'num_iterations': 1,
-        'num_steps': 500,                  # Full training: ~500 steps (500 * 5 batch = 2500 examples per iteration)
+        'num_steps': 1800,                  # Full training: ~500 steps (500 * 5 batch = 2500 examples per iteration)
         'batch_size': 5,                   # 5 examples per batch
         'num_generations': 4,              # Paper uses 4 or 8 (using 4 for faster output)
         'max_completion_length': 512,      # Max tokens per completion
@@ -843,7 +847,7 @@ if __name__ == "__main__":
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
         # Gating function selection (for research on alternative gating mechanisms)
-        'gating_type': 'kl_divergence',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
+        'gating_type': 'luong',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # Will override temperature_m3po if gating is used
             'debug': False,                # Enable debug logging
