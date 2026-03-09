@@ -22,20 +22,101 @@ Therefore, this implementation:
 """
 
 import os
+import math
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
+
+
+class EntropyTracker:
+    """Maintains EMA of entropy mean and variance for adaptive lambda computation."""
+
+    def __init__(self, decay: float = 0.95):
+        self.decay = decay
+        self.mu: float = 0.0
+        self.var: float = 0.0
+        self._initialized: bool = False
+
+    def update(self, entropy_tensor: torch.Tensor) -> Tuple[float, float]:
+        """
+        Update EMA statistics with a batch of entropy values.
+
+        Args:
+            entropy_tensor: (N,) tensor of per-path entropy values
+
+        Returns:
+            (mu_H, std_H) current EMA mean and std (std floored at 1e-6)
+        """
+        batch_mean = entropy_tensor.mean().item()
+        batch_var = entropy_tensor.var().item() if entropy_tensor.numel() > 1 else 0.0
+
+        if not self._initialized:
+            self.mu = batch_mean
+            self.var = batch_var
+            self._initialized = True
+        else:
+            self.mu = self.decay * self.mu + (1 - self.decay) * batch_mean
+            self.var = self.decay * self.var + (1 - self.decay) * batch_var
+
+        std = max(math.sqrt(self.var), 1e-6)
+        return self.mu, std
+
+    def reset(self):
+        """Reset tracker for reuse."""
+        self.mu = 0.0
+        self.var = 0.0
+        self._initialized = False
 
 
 @dataclass
 class M3POConfig:
     """Configuration for M3PO cross-path interaction."""
     num_generations: int = 4          # N paths per question
-    lambda_blend: float = 0.1         # Blending coefficient (paper default: 0.1)
     temperature: float = 0.1          # Attention temperature (paper default: 0.1)
     batch_size: int = 1               # Number of questions in batch
+    lambda_min: float = 0.01          # Minimum adaptive lambda
+    lambda_max: float = 0.3           # Maximum adaptive lambda
+    tau_H: float = 1.0                # Entropy normalization temperature
+    entropy_ema_decay: float = 0.95   # EMA decay for entropy tracker
+    lambda_blend: Optional[float] = None  # None = adaptive, float = fixed (backward compat)
+
+
+def compute_adaptive_lambda(
+    output_distributions: torch.Tensor,  # (N, vocab_size)
+    entropy_tracker: EntropyTracker,
+    lambda_min: float,
+    lambda_max: float,
+    tau_H: float,
+) -> torch.Tensor:
+    """
+    Compute per-trajectory adaptive lambda gated by output entropy.
+
+    lambda_i = lambda_min + (lambda_max - lambda_min) * sigmoid((H_i - mu_H) / (std_H * tau_H))
+
+    Args:
+        output_distributions: Softmax probabilities for each path (N, vocab_size)
+        entropy_tracker: EMA tracker for entropy statistics
+        lambda_min: Minimum lambda value
+        lambda_max: Maximum lambda value
+        tau_H: Temperature for entropy normalization
+
+    Returns:
+        adaptive_lambda: (N,) tensor of per-trajectory lambda values
+    """
+    # Compute entropy: H = -sum(p * log(p + eps))
+    eps = 1e-8
+    entropy = -(output_distributions * torch.log(output_distributions + eps)).sum(dim=-1)  # (N,)
+
+    # Update EMA and get statistics
+    mu_H, std_H = entropy_tracker.update(entropy.detach())
+
+    # Normalize and apply sigmoid gate (detached - no gradient flow through lambda)
+    z = (entropy.detach() - mu_H) / (std_H * tau_H)
+    adaptive_lambda = lambda_min + (lambda_max - lambda_min) * torch.sigmoid(z)  # (N,)
+
+    return adaptive_lambda
 
 
 def compute_cross_path_attention(
@@ -125,7 +206,7 @@ def blend_token_embeddings(
     token_embeddings: torch.Tensor,      # (N, hidden_dim) - embeddings of sampled tokens
     attention_weights: torch.Tensor,     # (N, N) - cross-path attention
     thinking_mask: List[bool],
-    lambda_blend: float = 0.1,
+    lambda_blend: Union[float, torch.Tensor] = 0.1,
 ) -> torch.Tensor:
     """
     Blend token embeddings using cross-path attention.
@@ -138,7 +219,7 @@ def blend_token_embeddings(
         token_embeddings: Embeddings of sampled tokens (N, hidden_dim)
         attention_weights: Cross-path attention matrix (N, N)
         thinking_mask: Which paths are still in thinking mode
-        lambda_blend: Blending coefficient (0 = no blend, 1 = full contextual)
+        lambda_blend: Blending coefficient - float for fixed, (N,) tensor for adaptive
 
     Returns:
         blended_embeddings: (N, hidden_dim) hybrid embeddings for next step
@@ -152,7 +233,12 @@ def blend_token_embeddings(
     contextual_embeddings = torch.mm(attention_weights.to(token_embeddings.dtype), token_embeddings)  # (N, hidden_dim)
 
     # Equation 2: Blend h̄_i = (1 - λ) * e_i + λ * c_i
-    blended = (1 - lambda_blend) * token_embeddings + lambda_blend * contextual_embeddings
+    # If lambda_blend is a tensor, reshape to (N, 1) for broadcasting with (N, hidden_dim)
+    if isinstance(lambda_blend, torch.Tensor):
+        lb = lambda_blend.unsqueeze(1)  # (N, 1)
+    else:
+        lb = lambda_blend
+    blended = (1 - lb) * token_embeddings + lb * contextual_embeddings
 
     # Only apply blending to paths still in thinking mode
     thinking_tensor = torch.tensor(thinking_mask, device=device, dtype=torch.bool)
@@ -160,7 +246,11 @@ def blend_token_embeddings(
 
     if debug:
         diff = (result - token_embeddings).abs().mean().item()
-        print(f"[M3PO] Blending with lambda={lambda_blend}, mean change={diff:.6f}")
+        if isinstance(lambda_blend, torch.Tensor):
+            lam_str = f"[{lambda_blend.min().item():.4f}, {lambda_blend.max().item():.4f}]"
+        else:
+            lam_str = f"{lambda_blend}"
+        print(f"[M3PO] Blending with lambda={lam_str}, mean change={diff:.6f}")
 
     return result
 
@@ -172,7 +262,8 @@ def apply_m3po_step(
     config: M3POConfig,
     thinking_mask: Optional[List[bool]] = None,
     gating_function=None,                # Optional: Alternative gating function (BaseM3POGating)
-) -> torch.Tensor:
+    entropy_tracker: Optional[EntropyTracker] = None,
+) -> Tuple[torch.Tensor, dict]:
     """
     Apply one step of M3PO cross-path interaction.
 
@@ -188,9 +279,12 @@ def apply_m3po_step(
         sampled_tokens: Token IDs that were sampled (batch_size * N,)
         config: M3PO configuration
         thinking_mask: Which paths are still in thinking mode
+        entropy_tracker: Optional tracker for adaptive lambda computation
 
     Returns:
-        blended_embeddings: (batch_size * N, 1, hidden_dim) ready for next step
+        Tuple of:
+            blended_embeddings: (batch_size * N, 1, hidden_dim) ready for next step
+            lambda_stats: dict with lambda_mean, lambda_min, lambda_max
     """
     debug = os.environ.get('M3PO_DEBUG', '0') == '1'
 
@@ -217,6 +311,7 @@ def apply_m3po_step(
 
     # Process each question's paths independently
     blended_list = []
+    step_lambdas = []
     for b in range(batch_size):
         start_idx = b * N
         end_idx = (b + 1) * N
@@ -234,12 +329,35 @@ def apply_m3po_step(
             gating_function=gating_function,
         )
 
+        # Determine lambda: fixed or adaptive
+        if config.lambda_blend is not None:
+            # Fixed lambda (backward compatible)
+            step_lambda = config.lambda_blend
+        elif entropy_tracker is not None:
+            # Adaptive lambda gated by entropy
+            step_lambda = compute_adaptive_lambda(
+                output_distributions=batch_dists,
+                entropy_tracker=entropy_tracker,
+                lambda_min=config.lambda_min,
+                lambda_max=config.lambda_max,
+                tau_H=config.tau_H,
+            )
+        else:
+            # Fallback to a reasonable default
+            step_lambda = 0.1
+
+        # Track lambda values
+        if isinstance(step_lambda, torch.Tensor):
+            step_lambdas.append(step_lambda.detach())
+        else:
+            step_lambdas.append(torch.tensor([step_lambda], device=batch_embeds.device))
+
         # Blend token embeddings
         blended = blend_token_embeddings(
             token_embeddings=batch_embeds,
             attention_weights=attention,
             thinking_mask=batch_thinking,
-            lambda_blend=config.lambda_blend,
+            lambda_blend=step_lambda,
         )
 
         blended_list.append(blended)
@@ -247,8 +365,16 @@ def apply_m3po_step(
     # Concatenate all batches: (batch_size * N, hidden_dim)
     result = torch.cat(blended_list, dim=0)
 
+    # Collect lambda stats
+    all_lambdas = torch.cat(step_lambdas)
+    lambda_stats = {
+        "lambda_mean": all_lambdas.mean().item(),
+        "lambda_min": all_lambdas.min().item(),
+        "lambda_max": all_lambdas.max().item(),
+    }
+
     # Add sequence dimension for transformer input: (batch_size * N, 1, hidden_dim)
-    return result.unsqueeze(1)
+    return result.unsqueeze(1), lambda_stats
 
 
 def apply_m3po_to_logits(
@@ -391,18 +517,25 @@ def generate_with_m3po(
     attention_mask: torch.Tensor,
     max_new_tokens: int = 512,
     num_generations: int = 4,
-    lambda_blend: float = 0.1,
+    lambda_blend: Optional[float] = None,
     temperature_m3po: float = 0.1,
     temperature_sampling: float = 1.0,
     pad_token_id: Optional[int] = None,
     eos_token_id: Optional[int] = None,
     thinking_end_tokens: Optional[List[int]] = None,
     gating_function=None,                # Optional: Alternative gating function (BaseM3POGating)
-) -> torch.Tensor:
+    lambda_min: float = 0.01,
+    lambda_max: float = 0.3,
+    tau_H: float = 1.0,
+    entropy_ema_decay: float = 0.95,
+) -> Tuple[torch.Tensor, dict]:
     """
     Generate with M3PO - cleaner implementation.
 
     Uses inputs_embeds for the entire generation to allow M3PO blending.
+
+    When lambda_blend is None, uses adaptive entropy-gated lambda.
+    When lambda_blend is a float, uses that fixed value (original behavior).
     """
     debug = os.environ.get('M3PO_DEBUG', '0') == '1'
 
@@ -417,7 +550,16 @@ def generate_with_m3po(
         lambda_blend=lambda_blend,
         temperature=temperature_m3po,
         batch_size=batch_size,
+        lambda_min=lambda_min,
+        lambda_max=lambda_max,
+        tau_H=tau_H,
+        entropy_ema_decay=entropy_ema_decay,
     )
+
+    # Create entropy tracker for adaptive lambda (one per generation call)
+    entropy_tracker = None
+    if lambda_blend is None:
+        entropy_tracker = EntropyTracker(decay=entropy_ema_decay)
 
     # Expand for parallel paths
     expanded_input_ids = input_ids.repeat_interleave(num_generations, dim=0)
@@ -435,7 +577,13 @@ def generate_with_m3po(
     # For production, you'd want to optimize this
 
     if debug:
-        print(f"[M3PO GEN v2] Starting: batch={batch_size}, N={num_generations}, total={total_paths}")
+        mode = "adaptive" if lambda_blend is None else f"fixed={lambda_blend}"
+        print(f"[M3PO GEN v2] Starting: batch={batch_size}, N={num_generations}, total={total_paths}, lambda={mode}")
+
+    # Collect lambda stats across all generation steps
+    all_step_lambda_means = []
+    all_step_lambda_mins = []
+    all_step_lambda_maxs = []
 
     for step in range(max_new_tokens):
         # Forward pass with embeddings
@@ -472,17 +620,22 @@ def generate_with_m3po(
         next_embeds = embed_tokens(next_tokens)  # (total_paths, hidden_dim)
 
         # Apply M3PO if any paths still thinking
-        if any(thinking_mask) and lambda_blend > 0:
+        # Adaptive mode (lambda_blend is None) always enters; fixed mode checks lambda > 0
+        if any(thinking_mask) and (lambda_blend is None or lambda_blend > 0):
             # Compute attention from output distributions
-            blended_embeds = apply_m3po_step(
+            blended_embeds, lambda_stats = apply_m3po_step(
                 logits=logits,  # Original logits for similarity
                 embed_tokens=embed_tokens,
                 sampled_tokens=next_tokens,
                 config=config,
                 thinking_mask=thinking_mask,
                 gating_function=gating_function,
+                entropy_tracker=entropy_tracker,
             )
             # Shape: (total_paths, 1, hidden_dim)
+            all_step_lambda_means.append(lambda_stats["lambda_mean"])
+            all_step_lambda_mins.append(lambda_stats["lambda_min"])
+            all_step_lambda_maxs.append(lambda_stats["lambda_max"])
         else:
             blended_embeds = next_embeds.unsqueeze(1)
 
@@ -507,11 +660,23 @@ def generate_with_m3po(
             active = sum(thinking_mask)
             print(f"[M3PO GEN v2] Step {step}: {active}/{total_paths} thinking, seq_len={inputs_embeds.shape[1]}")
 
-    return generated_ids
+    # Aggregate lambda stats across all generation steps
+    m3po_stats = {}
+    if all_step_lambda_means:
+        m3po_stats = {
+            "m3po/lambda_mean": sum(all_step_lambda_means) / len(all_step_lambda_means),
+            "m3po/lambda_min": min(all_step_lambda_mins),
+            "m3po/lambda_max": max(all_step_lambda_maxs),
+            "m3po/active_steps": len(all_step_lambda_means),
+        }
+
+    return generated_ids, m3po_stats
 
 
 __all__ = [
+    "EntropyTracker",
     "M3POConfig",
+    "compute_adaptive_lambda",
     "compute_cross_path_attention",
     "blend_token_embeddings",
     "apply_m3po_step",

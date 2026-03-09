@@ -19,6 +19,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+import bitsandbytes as bnb
+import math
 
 # Hugging Face libraries for transformer models
 sys.path.insert(0, os.path.abspath("transformers/src"))
@@ -304,7 +306,8 @@ def create_completion_mask(completion_ids, eos_token_id):
     return (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
 def generate_completions(model, tokenizer, prompts, num_generations=4, max_completion_length=32,
-                         lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True, gating_function=None):
+                         lambda_blend=None, temperature_m3po=0.1, use_m3po=True, gating_function=None,
+                         lambda_min=0.01, lambda_max=0.3, tau_H=1.0, entropy_ema_decay=0.95):
     """
     Generates multiple completions for each prompt with optional M3PO cross-path interaction.
 
@@ -314,12 +317,16 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         prompts (list): List of text prompts.
         num_generations (int): Number of completions to generate per prompt.
         max_completion_length (int): Maximum number of tokens to generate.
-        lambda_blend (float): M3PO blending coefficient (0 = no blending, 1 = full contextual).
+        lambda_blend (float or None): M3PO blending coefficient. None = adaptive, float = fixed.
         temperature_m3po (float): M3PO attention temperature (lower = sharper).
         use_m3po (bool): Whether to enable M3PO cross-path interaction.
+        lambda_min (float): Minimum adaptive lambda.
+        lambda_max (float): Maximum adaptive lambda.
+        tau_H (float): Entropy normalization temperature.
+        entropy_ema_decay (float): EMA decay for entropy tracker.
 
     Returns:
-        tuple: Containing prompt IDs, prompt mask, completion IDs, and completion mask.
+        tuple: Containing prompt IDs, prompt mask, completion IDs, completion mask, and m3po_stats.
 
     Explanation:
         1. Encodes the prompts and moves them to the appropriate device.
@@ -354,7 +361,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         # print(f"[M3PO] Thinking end tokens: {thinking_end_tokens}")
 
         # generate_with_m3po handles the expansion internally
-        outputs = generate_with_m3po(
+        outputs, m3po_stats = generate_with_m3po(
             model=model,
             input_ids=prompt_ids,
             attention_mask=prompt_mask,
@@ -367,6 +374,10 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             eos_token_id=tokenizer.eos_token_id,
             thinking_end_tokens=thinking_end_tokens if thinking_end_tokens else None,
             gating_function=gating_function,
+            lambda_min=lambda_min,
+            lambda_max=lambda_max,
+            tau_H=tau_H,
+            entropy_ema_decay=entropy_ema_decay,
         )
 
         # print("[M3PO] Generation complete")
@@ -379,6 +390,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         # Standard generation without M3PO
         prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_mask.repeat_interleave(num_generations, dim=0)
+        m3po_stats = {}
 
         outputs = model.generate(
             prompt_ids,
@@ -394,10 +406,11 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
     # print(f"Output batch size: {outputs.size(0)}, Device after model: {outputs.device}")
     completion_ids = outputs[:, prompt_length:]
     completion_mask = create_completion_mask(completion_ids, tokenizer.eos_token_id)
-    return prompt_ids, prompt_mask, completion_ids, completion_mask
+    return prompt_ids, prompt_mask, completion_ids, completion_mask, m3po_stats
 
 def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_generations, max_completion_length,
-                          lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True, gating_function=None):
+                          lambda_blend=None, temperature_m3po=0.1, use_m3po=True, gating_function=None,
+                          lambda_min=0.01, lambda_max=0.3, tau_H=1.0, entropy_ema_decay=0.95):
     """
     Generates data for GRPO rollouts including completions and log probabilities.
 
@@ -408,7 +421,7 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         batch_samples (list): Batch of training samples.
         num_generations (int): Number of completions to generate per sample.
         max_completion_length (int): Maximum completion length.
-        lambda_blend (float): M3PO blending coefficient.
+        lambda_blend (float or None): M3PO blending coefficient. None = adaptive.
         temperature_m3po (float): M3PO attention temperature.
         use_m3po (bool): Whether to enable M3PO cross-path interaction.
 
@@ -428,10 +441,11 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
     prompts = [sample["prompt"] if isinstance(sample, dict) else sample[0] for sample in batch_samples]
     answers = [sample["answer"] if isinstance(sample, dict) else sample[1] for sample in batch_samples]
     with torch.no_grad():
-        prompt_ids, prompt_mask, completion_ids, completion_mask = generate_completions(
+        prompt_ids, prompt_mask, completion_ids, completion_mask, m3po_stats = generate_completions(
             model, tokenizer, prompts, num_generations, max_completion_length,
             lambda_blend=lambda_blend, temperature_m3po=temperature_m3po, use_m3po=use_m3po,
-            gating_function=gating_function
+            gating_function=gating_function,
+            lambda_min=lambda_min, lambda_max=lambda_max, tau_H=tau_H, entropy_ema_decay=entropy_ema_decay,
         )
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -452,7 +466,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         "repeated_answers": repeated_answers,
         "logits_to_keep": logits_to_keep,
         "batch_size": len(prompts),
-        "num_generations": num_generations
+        "num_generations": num_generations,
+        "m3po_stats": m3po_stats,
     }
 
 def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0.01, epsilon=0.2, verbose=False,
@@ -491,11 +506,18 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
     old_log_probs = rollout_data["old_log_probs"]
     ref_log_probs = rollout_data["ref_log_probs"]
     if use_m3po and gating_function is not None and gating_function.has_learnable_parameters:
+        # For logit-level blending during loss, adaptive lambda isn't available (no step-by-step
+        # decoding). Use the mean adaptive lambda from generation to keep blending consistent.
+        if lambda_blend is not None:
+            loss_lambda = lambda_blend
+        else:
+            m3po_stats = rollout_data.get("m3po_stats", {})
+            loss_lambda = m3po_stats.get("m3po/lambda_mean", 0.1)
         token_log_probs = compute_log_probs_with_m3po(
             model, input_ids, attention_mask, logits_to_keep,
             batch_size=rollout_data["batch_size"],
             num_generations=rollout_data["num_generations"],
-            lambda_blend=lambda_blend, temperature_m3po=temperature_m3po,
+            lambda_blend=loss_lambda, temperature_m3po=temperature_m3po,
             gating_function=gating_function, completion_mask=completion_mask,
         )
     else:
@@ -585,11 +607,13 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
 def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=500, batch_size=4,
                               num_generations=4, max_completion_length=128, beta=0.1,
                               learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None, device_ids=None,
-                              lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True,
+                              lambda_blend=None, temperature_m3po=0.1, use_m3po=True,
                               gating_type='baseline', gating_config=None,
                               gating_warmup_steps=0, gating_lr=None, gating_grad_clip=None,
                               gating_warmup_min_steps=10, gating_warmup_patience=3,
-                              warmup_val_data=None, warmup_eval_interval=5):
+                              warmup_val_data=None, warmup_eval_interval=5,
+                              gradient_accumulation_steps=1, warmup_ratio=0.1,
+                              lambda_min=0.01, lambda_max=0.3, tau_H=1.0, entropy_ema_decay=0.95):
     """
     Train with GRPO + M3PO (Multi-Path Perception Policy Optimization).
 
@@ -633,7 +657,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     if use_m3po:
-        print(f"[M3PO] Training with cross-path interaction: lambda={lambda_blend}, temp={temperature_m3po}")
+        mode = "adaptive" if lambda_blend is None else f"fixed={lambda_blend}"
+        print(f"[M3PO] Training with cross-path interaction: lambda={mode}, temp={temperature_m3po}")
 
     # Create gating function if specified
     gating_function = None
@@ -705,7 +730,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         else:
             # Standard optimizer (no warmup or no learnable gating)
             if has_learnable_gating:
-                optimizer = torch.optim.AdamW(
+                optimizer = bnb.optim.AdamW8bit(
                     [
                         {"params": list(model.parameters()), "lr": learning_rate},
                         {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
@@ -715,12 +740,25 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 )
             else:
                 params_to_optimize = list(model.parameters())
-                optimizer = torch.optim.AdamW(
+                optimizer = bnb.optim.AdamW8bit(
                     params_to_optimize,
                     lr=learning_rate,
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
+
+        # Cosine LR scheduler with warmup (Paper Table 3)
+        num_steps_epoch = len(train_data) // batch_size
+        total_training_steps = num_steps_epoch * mu
+        warmup_steps = int(total_training_steps * warmup_ratio)
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            progress = (current_step - warmup_steps) / max(1, total_training_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         model.train()
 
         # Warmup plateau detection state
@@ -738,7 +776,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             in_warmup_phase = False
             for param in model.parameters():
                 param.requires_grad = True
-            return torch.optim.AdamW(
+            return bnb.optim.AdamW8bit(
                 [
                     {"params": list(model.parameters()), "lr": learning_rate},
                     {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
@@ -756,18 +794,21 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             wandb.log({"m3po/warmup_val_acc": val_acc, "step": step_num + 1})
             return val_acc
 
-        # Total steps = num_steps + warmup compensation (added dynamically after warmup ends)
-        total_steps = num_steps
+        # Inner loop: training steps with gradient accumulation.
+        # Shuffle dataset and iterate sequentially so every question is seen exactly once.
+        shuffled_data = train_data.copy()
+        random.shuffle(shuffled_data)
+        num_steps_actual = len(shuffled_data) // batch_size
+        optimizer.zero_grad()
+        accum_count = 0
 
-        # Inner loop: training steps.
         step = 0
-        while step < total_steps:
+        for step in range(num_steps_actual):
             # Phase transition: hard cap on warmup steps
             if in_warmup_phase and step == gating_warmup_steps:
                 optimizer = _transition_to_phase2(step, f"reached max {gating_warmup_steps} steps")
-                total_steps = num_steps + warmup_steps_used
 
-            batch_samples = random.sample(train_data, batch_size)
+            batch_samples = shuffled_data[step * batch_size : (step + 1) * batch_size]
             with torch.no_grad():
                 rollout_data = generate_rollout_data(
                     raw_model,
@@ -779,7 +820,11 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     lambda_blend=lambda_blend,
                     temperature_m3po=temperature_m3po,
                     use_m3po=use_m3po,
-                    gating_function=gating_function
+                    gating_function=gating_function,
+                    lambda_min=lambda_min,
+                    lambda_max=lambda_max,
+                    tau_H=tau_H,
+                    entropy_ema_decay=entropy_ema_decay,
                 )
             for grpo_iter in range(mu):
                 verbose_output = False
@@ -797,16 +842,22 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     temperature_m3po=temperature_m3po,
                     gating_function=gating_function,
                 )
-                optimizer.zero_grad()
-                loss.backward()
-                # Separate gradient clipping for model and gating params
-                if has_learnable_gating:
-                    if not in_warmup_phase:
+                # Scale loss for gradient accumulation
+                scaled_loss = loss / gradient_accumulation_steps
+                scaled_loss.backward()
+                accum_count += 1
+
+                if accum_count % gradient_accumulation_steps == 0:
+                    # Separate gradient clipping for model and gating params
+                    if has_learnable_gating:
+                        if not in_warmup_phase:
+                            torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
+                        torch.nn.utils.clip_grad_norm_(list(gating_function.parameters()), max_norm=effective_gating_grad_clip)
+                    else:
                         torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
-                    torch.nn.utils.clip_grad_norm_(list(gating_function.parameters()), max_norm=effective_gating_grad_clip)
-                else:
-                    torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=0.1)
-                optimizer.step()
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
                 step_loss = loss.item()
 
@@ -837,10 +888,15 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 log_dict = {
                     "loss": step_loss,
                     "average_reward": avg_reward,
+                    "learning_rate": scheduler.get_last_lr()[0],
                     "iteration": iteration + 1,
                     "step": step + 1,
-                    "grpo_iter": grpo_iter + 1
+                    "grpo_iter": grpo_iter + 1,
                 }
+                # Log M3PO adaptive lambda stats
+                m3po_stats = rollout_data.get("m3po_stats", {})
+                if m3po_stats:
+                    log_dict.update(m3po_stats)
                 if has_learnable_gating:
                     gating_grad_norm = sum(
                         p.grad.norm().item() ** 2 for p in gating_function.parameters() if p.grad is not None
@@ -854,10 +910,9 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     gating_function.reset_stats()
                 wandb.log(log_dict)
                 phase_str = ' [warmup]' if in_warmup_phase else ''
-                print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{total_steps}, "
-                      f"GRPO iter {grpo_iter+1}/{mu}, loss: {step_loss:.4f}{phase_str}")
-
-            step += 1
+                print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{num_steps_actual}, "
+                      f"GRPO iter {grpo_iter+1}/{mu}, loss: {step_loss:.4f}, "
+                      f"lr: {scheduler.get_last_lr()[0]:.2e}{phase_str}")
 
     except KeyboardInterrupt:
         print("\n\nCtrl+C detected! Stopping training early...")
@@ -965,13 +1020,10 @@ if __name__ == "__main__":
     print(f"Detected {num_gpus} GPUs")
     device_ids = list(range(num_gpus)) if num_gpus > 1 else None
 
-    all_data = prepare_dataset("test")
-    random.shuffle(all_data)
-    size_of_eval_data = 30 # change to a smaller value to save time or to a larger number for a more reliable estimate
-    size_of_warmup_val = 100  # Held-out validation set for gating warmup plateau detection
-    eval_data = all_data[:size_of_eval_data]
-    warmup_val_data = all_data[size_of_eval_data:size_of_eval_data + size_of_warmup_val]
-    train_data = all_data[size_of_eval_data + size_of_warmup_val:]  # Use remaining data for training
+    train_data = prepare_dataset("train")   # GSM8K train split (~7473 examples)
+    random.shuffle(train_data)
+    eval_data = prepare_dataset("test")     # GSM8K test split (~1319 examples)
+    warmup_val_data = eval_data[:100]       # Held-out validation set for gating warmup plateau detection
 
     # print("\nInitial model evaluation before finetuning:")
     # pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
@@ -988,18 +1040,24 @@ if __name__ == "__main__":
     # Tested on 8xA100 node with 80GB VRAM each
     training_config = {
         'num_iterations': 1,
-        'num_steps': 500,                  # Full training: ~500 steps (500 * 5 batch = 2500 examples per iteration)
-        'batch_size': 2,                   # Reduced for 1x A100 40GB
+        # num_steps is now computed automatically from dataset size: len(train_data) // batch_size
+        'batch_size': 4,                   # 4 prompts per step (effective 16 with grad accum)
         'num_generations': 4,              # Paper uses 4 or 8 (using 4 for faster output)
         'max_completion_length': 400,      # Reduced for 1x A100 40GB
         'beta': 0.005,                     # Paper value (KL penalty coefficient)
         'learning_rate': 5e-6,             # Paper value
-        'mu': 1,
+        'mu': 2,
         'epsilon': 0.1,
+        'gradient_accumulation_steps': 4,  # Paper Table 3
+        'warmup_ratio': 0.1,              # Paper Table 3: cosine schedule with warmup
         # M3PO-specific parameters (from paper Table 3)
-        'lambda_blend': 0.1,               # Blending coefficient λ
+        'lambda_blend': None,              # None = adaptive entropy-gated lambda, float = fixed
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
+        'lambda_min': 0.01,                # Minimum adaptive lambda
+        'lambda_max': 0.3,                 # Maximum adaptive lambda
+        'tau_H': 1.0,                      # Entropy normalization temperature
+        'entropy_ema_decay': 0.95,         # EMA decay for entropy tracker
         # Gating function selection (for research on alternative gating mechanisms)
         'gating_type': 'luong',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
