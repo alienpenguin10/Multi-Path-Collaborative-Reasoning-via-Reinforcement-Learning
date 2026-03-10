@@ -719,12 +719,22 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 )
         model.train()
 
-        # Fixed LR — cosine decay was causing LR to be well below 5e-6 for most of training.
-        # For RL/GRPO, fixed LR works better since the reward landscape keeps shifting.
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
-
         in_warmup_phase = has_learnable_gating and gating_warmup_steps > 0
         total_steps = num_steps + (gating_warmup_steps if in_warmup_phase else 0)
+
+        if in_warmup_phase:
+            # Phase 1 uses fixed LR for gating warmup; Phase 2 scheduler created at transition
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+        else:
+            # No gating warmup — use cosine schedule with warmup for the full run (paper Table 3)
+            phase2_total = num_steps
+            phase2_warmup = int(phase2_total * warmup_ratio)
+            def lr_lambda_full(current_step):
+                if current_step < phase2_warmup:
+                    return current_step / max(1, phase2_warmup)
+                progress = (current_step - phase2_warmup) / max(1, phase2_total - phase2_warmup)
+                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_full)
 
         # Inner loop: training steps with gradient accumulation.
         optimizer.zero_grad()
@@ -745,7 +755,20 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
-                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+                # Cosine LR schedule with warmup for Phase 2 (paper Table 3)
+                # Model params: warmup from 0 → 5e-6 then cosine decay (newly unfrozen)
+                # Gating params: no warmup (already at 5e-4 from Phase 1), just cosine decay
+                phase2_total = num_steps
+                phase2_warmup = int(phase2_total * warmup_ratio)
+                def lr_lambda_model(current_step):
+                    if current_step < phase2_warmup:
+                        return current_step / max(1, phase2_warmup)
+                    progress = (current_step - phase2_warmup) / max(1, phase2_total - phase2_warmup)
+                    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+                def lr_lambda_gating(current_step):
+                    progress = current_step / max(1, phase2_total)
+                    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda_model, lr_lambda_gating])
                 optimizer.zero_grad()
                 accum_count = 0
 
