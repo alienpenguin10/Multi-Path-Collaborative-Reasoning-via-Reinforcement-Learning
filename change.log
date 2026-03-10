@@ -1,4 +1,5 @@
-Unwrap DataParallel before save_pretrained/push_to_hub                                                                                                                                           
+Unwrap DataParallel before save_pretrained/push_to_hub
+  1. Does look at all 7000 training examples                                                                                                                                           
   2. Read HF token from .env instead of hardcoded                                                                                                                                                   
   3. Read wandb keys from .env via load_dotenv() at top                                                                                                                                               
   4. Added experiment variable to control wandb name, save dir, and HF repo                                                                                                                           

@@ -660,6 +660,11 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
     # print(f"Input batch size: {prompt_ids.size(0)}, Device before model: {prompt_ids.device}")
     prompt_length = prompt_ids.size(1)
 
+    # Switch to eval mode for generation to disable gradient checkpointing,
+    # which conflicts with KV caching used internally by model.generate().
+    was_training = model.training
+    model.eval()
+
     if use_m3po:
         # Use the new M3PO generation that correctly applies cross-path interaction
         # in the embedding space (as per the paper)
@@ -717,6 +722,10 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             eos_token_id=tokenizer.eos_token_id,
             early_stopping=False
         )
+
+    # Restore training mode for subsequent gradient updates
+    if was_training:
+        model.train()
 
     completion_ids = outputs[:, prompt_length:]
     completion_mask = create_completion_mask(completion_ids, tokenizer.eos_token_id)
@@ -1111,7 +1120,7 @@ if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using primary device: {device}")
 
-    experiment = "M3PO"  # Change this to save models, wandb runs, and HF repos under a different name
+    experiment = "M3PO_ONLY"  # Change this to save models, wandb runs, and HF repos under a different name
 
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     output_dir = f"{experiment}_finetuned_model"

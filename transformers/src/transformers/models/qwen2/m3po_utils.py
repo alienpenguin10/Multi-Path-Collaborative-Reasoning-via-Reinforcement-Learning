@@ -334,7 +334,7 @@ def apply_m3po_step(
         if isinstance(step_lambda, torch.Tensor):
             step_lambdas.append(step_lambda.detach())
         else:
-            step_lambdas.append(torch.tensor([step_lambda], device=device))
+            step_lambdas.append(torch.tensor([step_lambda], device=batch_embeds.device))
 
         # Blend token embeddings
         blended = blend_token_embeddings(
