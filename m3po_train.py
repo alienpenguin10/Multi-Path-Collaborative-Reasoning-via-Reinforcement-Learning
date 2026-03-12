@@ -795,6 +795,11 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 in_warmup_phase = False
                 for param in model.parameters():
                     param.requires_grad = True
+                # Save gating optimizer state before replacing optimizer
+                old_gating_state = {}
+                for p in gating_function.parameters():
+                    if p in optimizer.state:
+                        old_gating_state[p] = optimizer.state[p]
                 optimizer = bnb.optim.AdamW8bit(
                     [
                         {"params": list(model.parameters()), "lr": learning_rate},
@@ -803,6 +808,10 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
+                # Restore gating Adam state (momentum + variance) from Phase 1
+                for p in gating_function.parameters():
+                    if p in old_gating_state:
+                        optimizer.state[p] = old_gating_state[p]
                 phase2_optimizer_step_count = 0
                 temp_anneal_steps = 100
                 target_temperature = gating_config.get('temperature', 0.1) if gating_config else 0.1

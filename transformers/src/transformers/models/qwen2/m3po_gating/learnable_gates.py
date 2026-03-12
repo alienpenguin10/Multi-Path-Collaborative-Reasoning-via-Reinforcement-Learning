@@ -52,7 +52,7 @@ class LuongAttentionGating(BaseM3POGating):
 
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(config)
-        self.rank = self.config.get("rank", 512)
+        self.rank = self.config.get("rank", 128)
         self.vocab_size = self.config.get("vocab_size", 151936)
 
         # Low-rank factorization: W = U @ V^T
