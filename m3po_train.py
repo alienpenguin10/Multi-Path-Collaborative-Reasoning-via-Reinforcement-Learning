@@ -715,13 +715,23 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             gating_function = gating_function.to(device)
             effective_gating_lr = gating_lr if gating_lr is not None else learning_rate * 100
             effective_gating_grad_clip = gating_grad_clip if gating_grad_clip is not None else 1.0
+            if is_main_process():
+                gating_params = list(gating_function.parameters())
+                print(f"[M3PO] Gating function has {len(gating_params)} parameter tensors, "
+                      f"shapes: {[p.shape for p in gating_params]}")
 
         if has_learnable_gating and gating_warmup_steps > 0:
             # Phase 1: freeze model, train only gating params for fixed N steps
             for param in model.parameters():
                 param.requires_grad = False
+            gating_params_list = list(gating_function.parameters())
+            if not gating_params_list:
+                raise RuntimeError(
+                    f"[M3PO] Gating function {type(gating_function).__name__} has no parameters! "
+                    f"Module children: {list(gating_function.named_parameters())}"
+                )
             optimizer = bnb.optim.AdamW8bit(
-                list(gating_function.parameters()),
+                gating_params_list,
                 lr=effective_gating_lr,
                 weight_decay=0.0,
                 betas=(0.9, 0.99),
@@ -1051,7 +1061,7 @@ if __name__ == "__main__":
         'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # Target temperature (annealed to from 1.0)
             'rank': 32,                    # Was 256 → fewer params, faster convergence
-            'init_strategy': 'xavier',     # Was 'identity' → breaks cosine-similarity basin
+            'init_strategy': 'identity',    # Identity init: right numerical regime (~0.001 grad norms)
             'debug': False,                # Enable debug logging
         },
         'gating_warmup_steps': 150,        # Was 50 → more time to diverge from baseline

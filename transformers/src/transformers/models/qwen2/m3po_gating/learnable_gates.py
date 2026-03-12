@@ -63,8 +63,8 @@ class LuongAttentionGating(BaseM3POGating):
             # meaningful (~0.01-0.1) instead of ~0 from tiny Xavier init.
             random_matrix = torch.randn(self.vocab_size, self.rank)
             Q, _ = torch.linalg.qr(random_matrix)
-            self.U = nn.Parameter(Q.clone())
-            self.V = nn.Parameter(Q.clone())
+            self.U = nn.Parameter(Q.clone().contiguous())
+            self.V = nn.Parameter(Q.clone().contiguous())
         else:  # xavier
             std = math.sqrt(2.0 / (self.vocab_size + self.rank))
             self.U = nn.Parameter(torch.randn(self.vocab_size, self.rank) * std)
