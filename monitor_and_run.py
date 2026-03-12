@@ -25,6 +25,7 @@ CHECK_INTERVAL = 240             # Seconds between checks
 MEMORY_THRESHOLD_MB = 500       # GPU is "free" if memory < this
 CONDA_ENV = "ant"               # Conda environment name
 CONDA_PYTHON = os.path.expanduser("~/Neuralese/miniconda3/envs/ant/bin/python")
+CONDA_TORCHRUN = os.path.expanduser("~/Neuralese/miniconda3/envs/ant/bin/torchrun")
 TARGET_GPUS = None               # Consider all GPUs (set to list like [3, 6, 7] to restrict)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPERIMENT_SCRIPT = os.path.join(SCRIPT_DIR, "run_m3po_experiment.py")
@@ -84,7 +85,7 @@ def launch_training(free_gpu_ids):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_str
 
-    cmd = [CONDA_PYTHON, EXPERIMENT_SCRIPT] + EXPERIMENT_ARGS
+    cmd = [CONDA_TORCHRUN, f"--nproc_per_node={len(free_gpu_ids)}", EXPERIMENT_SCRIPT] + EXPERIMENT_ARGS
     print(f"Setting CUDA_VISIBLE_DEVICES={gpu_str}")
     print(f"Training will see {len(free_gpu_ids)} GPUs (remapped as 0..{len(free_gpu_ids)-1})")
     print(f"Running: {' '.join(cmd)}")
@@ -97,6 +98,49 @@ def launch_training(free_gpu_ids):
         cwd=SCRIPT_DIR,
         check=True,
     )
+
+
+def hold_gpus(gpu_ids):
+    """
+    Allocate large tensors on each GPU to reserve VRAM and prevent others from using them.
+    Blocks until Ctrl+C is pressed.
+    """
+    if "torch" in sys.modules:
+        # torch was already imported — CUDA_VISIBLE_DEVICES changes won't take effect.
+        # Spawn a subprocess to hold GPUs with a clean torch import.
+        gpu_str = ",".join(str(g) for g in gpu_ids)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_str
+        script = (
+            "import torch, time\n"
+            f"holders = [torch.empty(20*1024*1024*1024//4, dtype=torch.float32, device=f'cuda:{{i}}') for i in range({len(gpu_ids)})]\n"
+            f"print(f'\\nHolding {len(gpu_ids)} GPUs (physical IDs: {gpu_ids}). Press Ctrl+C to release.')\n"
+            "try:\n"
+            "    while True:\n"
+            "        time.sleep(60)\n"
+            "except KeyboardInterrupt:\n"
+            "    print('\\nReleasing GPUs...')\n"
+        )
+        subprocess.run([CONDA_PYTHON, "-c", script], env=env)
+        return
+
+    import torch
+
+    num_gpus = len(gpu_ids)
+    holders = []
+    for i in range(num_gpus):
+        # Allocate ~20GB per GPU to reserve most of the VRAM
+        t = torch.empty(20 * 1024 * 1024 * 1024 // 4, dtype=torch.float32, device=f"cuda:{i}")
+        holders.append(t)
+
+    print(f"\nHolding {num_gpus} GPUs (physical IDs: {gpu_ids}). Press Ctrl+C to release.")
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\nReleasing GPUs...")
+        del holders
+        torch.cuda.empty_cache()
 
 
 def main():
@@ -129,16 +173,20 @@ def main():
             print(f"Using GPUs: {free_gpu_ids}")
             print(f"{'='*60}\n")
 
+            # Set CUDA_VISIBLE_DEVICES in parent process before torch import (for hold_gpus)
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in free_gpu_ids)
+
             try:
                 launch_training(free_gpu_ids)
                 print("\nTraining completed successfully!")
-                sys.exit(0)
             except subprocess.CalledProcessError as e:
                 print(f"\nError: Training script failed with return code {e.returncode}", file=sys.stderr)
-                sys.exit(1)
             except KeyboardInterrupt:
                 print("\nTraining interrupted by user")
-                sys.exit(130)
+
+            # Always hold GPUs after training finishes/fails/is interrupted
+            hold_gpus(free_gpu_ids)
+            sys.exit(0)
 
         try:
             time.sleep(CHECK_INTERVAL)

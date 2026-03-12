@@ -54,6 +54,18 @@ def set_random_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+# Find next available trial number
+def get_next_trial_number(base_dir, gating_name):
+    """Find the next available trial number for this gating type."""
+    gating_dir = os.path.join(base_dir, gating_name)
+    if not os.path.exists(gating_dir):
+        return 1
+    existing_trials = [
+        int(d.replace("trial_", "")) 
+        for d in os.listdir(gating_dir) 
+        if d.startswith("trial_") and d.replace("trial_", "").isdigit()
+    ]
+    return max(existing_trials, default=0) + 1
 
 """
 Part 2: Data Formatting and Answer Extraction

@@ -46,7 +46,7 @@ os.environ["WANDB_PROJECT"] = os.getenv("WANDB_PROJECT", "m3po-experiments")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils import set_random_seed, prepare_dataset, evaluate_model, combined_reward
-from grpo_train import train_with_grpo, optimize_model_memory, reserve_gpu_memory
+from m3po_train import train_with_grpo, optimize_model_memory, reserve_gpu_memory
 
 # ── Constants ────────────────────────────────────────────────────────────────
 

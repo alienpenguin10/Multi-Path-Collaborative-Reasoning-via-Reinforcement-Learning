@@ -11,7 +11,6 @@ import math
 import numpy as np
 import wandb
 import sys
-import os
 
 # Must be set before any CUDA operations to prevent memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -19,19 +18,22 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # PyTorch and related libraries for deep learning
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils.rnn import pad_sequence
+import datetime
 import bitsandbytes as bnb
 
 # Hugging Face libraries for transformer models
 sys.path.insert(0, os.path.abspath("transformers/src"))
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-os.environ["M3PO_DEBUG"] = "-1"  # Enable M3PO debug prints
+os.environ["M3PO_DEBUG"] = "-1"  # Disable M3PO debug prints (set to "1" to enable)
 
 from dotenv import load_dotenv
 load_dotenv()
 # Call the function to set random seed for reproducibility
-from utils import set_random_seed   
+from utils import set_random_seed, get_next_trial_number
 set_random_seed(42)
 
 
@@ -61,10 +63,29 @@ Part 5: Reward Functions
 from utils import combined_reward
 
 """
-Part 6: DataParallel GRPO From Scratch
+Part 6: DDP Helpers
+"""
+def setup_ddp():
+    """Initialize distributed training. Called by each process spawned by torchrun."""
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+def cleanup_ddp():
+    """Tear down distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process():
+    """Returns True if this is rank 0 (or if DDP is not active)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+"""
+Part 7: DDP GRPO From Scratch
 In this section, we implement all the building blocks of the GRPO algorithm from scratch. 
 The implementation assumes that the machine running the code has at least 2 GPUs. 
-We use PyTorch's DataParallel API to distribute the policy model across the GPU cores, one copy of the model per GPU core. The batch is split between the GPU cores.
+We use PyTorch's DistributedDataParallel (DDP) to distribute the policy model across GPUs, one process per GPU. Each process trains on different data and gradients are synchronized via ring-allreduce.
 """
 def selective_log_softmax(logits, input_ids, chunk_size=2):
     """
@@ -255,7 +276,7 @@ def detect_thinking_phase_end(tokenizer, completion_ids):
     try:
         end_reasoning_tokens = tokenizer.encode("</reasoning>", add_special_tokens=False)
         answer_start_tokens = tokenizer.encode("<answer>", add_special_tokens=False)
-    except:
+    except Exception:
         # If encoding fails, assume all paths are still thinking
         return [True] * total_sequences
 
@@ -330,7 +351,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         3. Extracts the completion IDs (excluding the prompt tokens).
         4. Creates a mask for the completions using create_completion_mask.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
     prompt_ids = inputs["input_ids"].to(device)
     prompt_mask = inputs["attention_mask"].to(device)
@@ -349,7 +370,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             # </reasoning> and <answer> tokens signal end of thinking
             thinking_end_tokens.extend(tokenizer.encode("</reasoning>", add_special_tokens=False))
             thinking_end_tokens.extend(tokenizer.encode("<answer>", add_special_tokens=False))
-        except:
+        except Exception:
             pass
 
         # print(f"[M3PO] Enabled with lambda={lambda_blend}, temp={temperature_m3po}, paths={prompt_ids.size(0) * num_generations}")
@@ -390,7 +411,6 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             temperature=1.0,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            early_stopping=False
         )
 
     # print(f"Output batch size: {outputs.size(0)}, Device after model: {outputs.device}")
@@ -399,7 +419,8 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
     return prompt_ids, prompt_mask, completion_ids, completion_mask
 
 def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_generations, max_completion_length,
-                          lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True, gating_function=None):
+                          lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True, gating_function=None,
+                          compiled_model=None):
     """
     Generates data for GRPO rollouts including completions and log probabilities.
 
@@ -426,7 +447,7 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         6. Repeats prompts and answers to match the number of generated completions.
         7. Returns all data needed for GRPO loss calculation.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prompts = [sample["prompt"] if isinstance(sample, dict) else sample[0] for sample in batch_samples]
     answers = [sample["answer"] if isinstance(sample, dict) else sample[1] for sample in batch_samples]
     with torch.no_grad():
@@ -438,7 +459,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
-        old_log_probs = compute_log_probs(model, input_ids, attention_mask, logits_to_keep)
+        fwd_model = compiled_model if compiled_model is not None else model
+        old_log_probs = compute_log_probs(fwd_model, input_ids, attention_mask, logits_to_keep)
         ref_log_probs = compute_log_probs(ref_model, input_ids, attention_mask, logits_to_keep)
     formatted_completions = [[{'content': tokenizer.decode(ids, skip_special_tokens=True)}] for ids in completion_ids]
     repeated_prompts = [p for p in prompts for _ in range(num_generations)]
@@ -458,7 +480,8 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
     }
 
 def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0.01, epsilon=0.2, verbose=False,
-              use_m3po=False, lambda_blend=0.1, temperature_m3po=0.1, gating_function=None):
+              use_m3po=False, lambda_blend=0.1, temperature_m3po=0.1, gating_function=None,
+              compiled_model=None):
     """
     Computes the GRPO loss for updating the policy model.
 
@@ -485,23 +508,24 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
         7. Combines surrogate loss and KL penalty.
         8. Averages the loss across all tokens and batches.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     input_ids = rollout_data["input_ids"]
     attention_mask = rollout_data["attention_mask"]
     completion_mask = rollout_data["completion_mask"]
     logits_to_keep = rollout_data["logits_to_keep"]
     old_log_probs = rollout_data["old_log_probs"]
     ref_log_probs = rollout_data["ref_log_probs"]
+    fwd_model = compiled_model if compiled_model is not None else model
     if use_m3po and gating_function is not None and gating_function.has_learnable_parameters:
         token_log_probs = compute_log_probs_with_m3po(
-            model, input_ids, attention_mask, logits_to_keep,
+            fwd_model, input_ids, attention_mask, logits_to_keep,
             batch_size=rollout_data["batch_size"],
             num_generations=rollout_data["num_generations"],
             lambda_blend=lambda_blend, temperature_m3po=temperature_m3po,
             gating_function=gating_function, completion_mask=completion_mask,
         )
     else:
-        token_log_probs = compute_log_probs(model, input_ids, attention_mask, logits_to_keep)
+        token_log_probs = compute_log_probs(fwd_model, input_ids, attention_mask, logits_to_keep)
     ratio = torch.exp(token_log_probs - old_log_probs)
     rewards_list = reward_function(prompts=rollout_data["repeated_prompts"], completions=rollout_data["formatted_completions"], answer=rollout_data["repeated_answers"])
     rewards = torch.tensor(
@@ -586,7 +610,8 @@ def grpo_loss(model, ref_model, rollout_data, tokenizer, reward_function, beta=0
 
 def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=500, batch_size=4,
                               num_generations=4, max_completion_length=128, beta=0.1,
-                              learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None, device_ids=None,
+                              learning_rate=5e-6, mu=3, epsilon=0.2, reward_function=None,
+                              local_rank=0,
                               lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True,
                               gating_type='baseline', gating_config=None,
                               gating_warmup_steps=0, gating_lr=None, gating_grad_clip=None,
@@ -611,7 +636,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         mu (int): Number of policy updates per batch.
         epsilon (float): PPO clipping parameter.
         reward_function: Function that calculates rewards for completions.
-        device_ids (list): List of GPU device IDs for DataParallel.
+        local_rank (int): Local GPU rank for DDP (set by torchrun).
         lambda_blend (float): M3PO blending coefficient λ (0.1 in paper).
         temperature_m3po (float): M3PO attention temperature T (0.1 in paper).
         use_m3po (bool): Whether to enable M3PO cross-path interaction.
@@ -631,9 +656,9 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 ii. Updates the policy model using gradient descent.
            - Monitors GPU memory usage and prints progress information.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if use_m3po:
+    if use_m3po and is_main_process():
         print(f"[M3PO] Training with cross-path interaction: lambda={lambda_blend}, temp={temperature_m3po}")
 
     # Create gating function if specified
@@ -646,31 +671,35 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             gating_config['temperature'] = temperature_m3po
         try:
             gating_function = create_gating_function(gating_type, gating_config)
-            print(f"[M3PO] Using {gating_type} gating function with config: {gating_config}")
-            if gating_function and gating_function.has_learnable_parameters:
-                print(f"[M3PO] Warning: Learnable gating parameters detected. Gradient flow will be enabled during loss computation.")
+            if is_main_process():
+                print(f"[M3PO] Using {gating_type} gating function with config: {gating_config}")
+                if gating_function and gating_function.has_learnable_parameters:
+                    print(f"[M3PO] Warning: Learnable gating parameters detected. Gradient flow will be enabled during loss computation.")
         except ValueError as e:
-            print(f"[M3PO] Error creating gating function: {e}")
-            print(f"[M3PO] Falling back to baseline (cosine similarity)")
+            if is_main_process():
+                print(f"[M3PO] Error creating gating function: {e}")
+                print(f"[M3PO] Falling back to baseline (cosine similarity)")
             gating_function = None
 
-    # Wrap model with DataParallel if multiple GPUs are available.
-
-    if device_ids is not None and len(device_ids) > 1:
-        model = nn.DataParallel(model, device_ids=device_ids)
-        print(f"Model wrapped with DataParallel across GPUs: {device_ids}")
-        is_data_parallel = True
+    # Wrap model with DDP if distributed training is active.
+    model.to(device)
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if is_main_process():
+            print(f"Model wrapped with DDP across {dist.get_world_size()} GPUs")
     else:
-        model.to(device)
         print(f"Running on single GPU: {device}")
-        is_data_parallel = False
 
-    raw_model = model.module if is_data_parallel else model
+    raw_model = model.module if dist.is_initialized() else model
+
+    # torch.compile for faster forward/backward (generation skips via torch.compiler.disable)
+    compiled_model = torch.compile(raw_model)
 
     # Outer loop: iterative GRPO updates.
     try:
       for iteration in range(num_iterations):
-        print(f"\nIteration {iteration+1}/{num_iterations}")
+        if is_main_process():
+            print(f"\nIteration {iteration+1}/{num_iterations}")
 
         # Create a reference model (deep copy) and set it to eval mode.
         ref_model = copy.deepcopy(raw_model)
@@ -694,21 +723,27 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             optimizer = bnb.optim.AdamW8bit(
                 list(gating_function.parameters()),
                 lr=effective_gating_lr,
-                weight_decay=0.1,
+                weight_decay=0.0,
                 betas=(0.9, 0.99),
             )
-            print(f"[M3PO] Phase 1 (warmup): training only gating params for {gating_warmup_steps} steps at lr={effective_gating_lr}")
+            gating_function.set_temperature(1.0)  # High temp for gradient flow during warmup
+            if is_main_process():
+                print(f"[M3PO] Phase 1 (warmup): training only gating params for {gating_warmup_steps} steps at lr={effective_gating_lr}")
         else:
             # Standard optimizer (no warmup or no learnable gating)
             if has_learnable_gating:
                 optimizer = bnb.optim.AdamW8bit(
                     [
                         {"params": list(model.parameters()), "lr": learning_rate},
-                        {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
+                        {"params": list(gating_function.parameters()), "lr": effective_gating_lr, "weight_decay": 0.0},
                     ],
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
+                gating_function.set_temperature(1.0)  # High temp for gradient flow
+                phase2_optimizer_step_count = 0
+                temp_anneal_steps = 100
+                target_temperature = gating_config.get('temperature', 0.1) if gating_config else 0.1
             else:
                 params_to_optimize = list(model.parameters())
                 optimizer = bnb.optim.AdamW8bit(
@@ -727,7 +762,9 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
         else:
             # No gating warmup — use cosine schedule with warmup for the full run (paper Table 3)
-            phase2_total = num_steps
+            # scheduler.step() is called per optimizer step, not per outer step.
+            # Each outer step does `mu` backwards; optimizer steps every `gradient_accumulation_steps`.
+            phase2_total = num_steps * mu // gradient_accumulation_steps
             phase2_warmup = int(phase2_total * warmup_ratio)
             def lr_lambda_full(current_step):
                 if current_step < phase2_warmup:
@@ -743,22 +780,27 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         while step < total_steps:
             # Phase transition: fixed warmup complete
             if in_warmup_phase and step == gating_warmup_steps:
-                print(f"[M3PO] Phase 2 at step {step + 1}: unfreezing model for joint training")
+                if is_main_process():
+                    print(f"[M3PO] Phase 2 at step {step + 1}: unfreezing model for joint training")
                 in_warmup_phase = False
                 for param in model.parameters():
                     param.requires_grad = True
                 optimizer = bnb.optim.AdamW8bit(
                     [
                         {"params": list(model.parameters()), "lr": learning_rate},
-                        {"params": list(gating_function.parameters()), "lr": effective_gating_lr},
+                        {"params": list(gating_function.parameters()), "lr": effective_gating_lr, "weight_decay": 0.0},
                     ],
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
+                phase2_optimizer_step_count = 0
+                temp_anneal_steps = 100
+                target_temperature = gating_config.get('temperature', 0.1) if gating_config else 0.1
                 # Cosine LR schedule with warmup for Phase 2 (paper Table 3)
                 # Model params: warmup from 0 → 5e-6 then cosine decay (newly unfrozen)
                 # Gating params: no warmup (already at 5e-4 from Phase 1), just cosine decay
-                phase2_total = num_steps
+                # Schedule length = number of optimizer steps in phase 2
+                phase2_total = num_steps * mu // gradient_accumulation_steps
                 phase2_warmup = int(phase2_total * warmup_ratio)
                 def lr_lambda_model(current_step):
                     if current_step < phase2_warmup:
@@ -773,19 +815,19 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 accum_count = 0
 
             batch_samples = random.sample(train_data, batch_size)
-            with torch.no_grad():
-                rollout_data = generate_rollout_data(
-                    raw_model,
-                    ref_model,
-                    tokenizer,
-                    batch_samples,
-                    num_generations,
-                    max_completion_length,
-                    lambda_blend=lambda_blend,
-                    temperature_m3po=temperature_m3po,
-                    use_m3po=use_m3po,
-                    gating_function=gating_function
-                )
+            rollout_data = generate_rollout_data(
+                raw_model,
+                ref_model,
+                tokenizer,
+                batch_samples,
+                num_generations,
+                max_completion_length,
+                lambda_blend=lambda_blend,
+                temperature_m3po=temperature_m3po,
+                use_m3po=use_m3po,
+                gating_function=gating_function,
+                compiled_model=compiled_model,
+            )
             for grpo_iter in range(mu):
                 verbose_output = False
                 loss, avg_reward = grpo_loss(
@@ -801,10 +843,18 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     lambda_blend=lambda_blend,
                     temperature_m3po=temperature_m3po,
                     gating_function=gating_function,
+                    compiled_model=compiled_model,
                 )
                 # Scale loss for gradient accumulation
                 scaled_loss = loss / gradient_accumulation_steps
                 scaled_loss.backward()
+
+                # Sync learnable gating gradients across DDP ranks
+                if has_learnable_gating and dist.is_initialized():
+                    for p in gating_function.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
                 accum_count += 1
 
                 if accum_count % gradient_accumulation_steps == 0:
@@ -819,38 +869,49 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     scheduler.step()
                     optimizer.zero_grad()
 
-                step_loss = loss.item()
+                    # Temperature annealing: linearly decay from 1.0 to target over first 100 Phase 2 steps
+                    if has_learnable_gating and not in_warmup_phase:
+                        phase2_optimizer_step_count += 1
+                        if phase2_optimizer_step_count <= temp_anneal_steps:
+                            progress = phase2_optimizer_step_count / temp_anneal_steps
+                            current_temp = 1.0 + (target_temperature - 1.0) * progress
+                            gating_function.set_temperature(current_temp)
 
-                # Log to wandb
-                log_dict = {
-                    "loss": step_loss,
-                    "average_reward": avg_reward,
-                    "learning_rate": scheduler.get_last_lr()[0],
-                    "iteration": iteration + 1,
-                    "step": step + 1,
-                    "grpo_iter": grpo_iter + 1,
-                }
-                if has_learnable_gating:
-                    gating_grad_norm = sum(
-                        p.grad.norm().item() ** 2 for p in gating_function.parameters() if p.grad is not None
-                    ) ** 0.5
-                    log_dict["m3po/gating_grad_norm"] = gating_grad_norm
-                if gating_function is not None:
-                    stats = gating_function.get_stats_summary()
-                    for key, value in stats.items():
-                        log_dict[f"m3po/{key}"] = value
-                    gating_function.reset_stats()
-                wandb.log(log_dict)
-                phase_str = ' [warmup]' if in_warmup_phase else ''
-                print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{total_steps}, "
-                      f"GRPO iter {grpo_iter+1}/{mu}, loss: {step_loss:.4f}, "
-                      f"lr: {scheduler.get_last_lr()[0]:.2e}{phase_str}")
+                # Log to wandb (rank 0 only)
+                if is_main_process():
+                    step_loss = loss.item()
+                    log_dict = {
+                        "loss": step_loss,
+                        "average_reward": avg_reward,
+                        "learning_rate": scheduler.get_last_lr()[0],
+                        "iteration": iteration + 1,
+                        "step": step + 1,
+                        "grpo_iter": grpo_iter + 1,
+                    }
+                    if has_learnable_gating:
+                        gating_grad_norm = sum(
+                            p.grad.norm().item() ** 2 for p in gating_function.parameters() if p.grad is not None
+                        ) ** 0.5
+                        log_dict["m3po/gating_grad_norm"] = gating_grad_norm
+                        log_dict["m3po/temperature"] = gating_function.temperature
+                        log_dict["m3po/gating_lr"] = scheduler.get_last_lr()[-1]
+                    if gating_function is not None:
+                        stats = gating_function.get_stats_summary()
+                        for key, value in stats.items():
+                            log_dict[f"m3po/{key}"] = value
+                        gating_function.reset_stats()
+                    wandb.log(log_dict)
+                    phase_str = ' [warmup]' if in_warmup_phase else ''
+                    print(f"Iteration {iteration+1}/{num_iterations}, Step {step+1}/{total_steps}, "
+                          f"GRPO iter {grpo_iter+1}/{mu}, loss: {step_loss:.4f}, "
+                          f"lr: {scheduler.get_last_lr()[0]:.2e}{phase_str}")
 
             step += 1
 
     except KeyboardInterrupt:
-        print("\n\nCtrl+C detected! Stopping training early...")
-        print("Model weights will be saved and evaluation will proceed.")
+        if is_main_process():
+            print("\n\nCtrl+C detected! Stopping training early...")
+            print("Model weights will be saved and evaluation will proceed.")
 
     return raw_model
 
@@ -930,53 +991,53 @@ def optimize_model_memory(model):
     return model
 
 if __name__ == "__main__":
-    # Main execution
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Using primary device: {device}")
+    # DDP setup — torchrun sets LOCAL_RANK, RANK, WORLD_SIZE env vars
+    local_rank, rank, world_size = setup_ddp()
+    device = torch.device("cuda")
+    if is_main_process():
+        print(f"DDP initialized: {world_size} GPU(s), primary device: {device}")
 
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    output_dir = "math_solver_model"
+    base_output_dir = "output"
 
-    print(f"Loading fine-tuned model from {model_name}...")
+    if is_main_process():
+        print(f"Loading model from {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="auto"
+        device_map={"": local_rank}  # Each rank loads to its own GPU
     )
-    print("Fine-tuned model loaded")
+    if is_main_process():
+        print("Model loaded")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
     model.config.pad_token_id = tokenizer.eos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
 
-    num_gpus = torch.cuda.device_count()
-    print(f"Detected {num_gpus} GPUs")
-    device_ids = list(range(num_gpus)) if num_gpus > 1 else None
-
     train_data = prepare_dataset("train")
     eval_data = prepare_dataset("test")
+
+    # Use only half of the data for testing
+    train_data = train_data[:len(train_data)//2]
+    eval_data = eval_data[:len(eval_data)//2]
+
     random.shuffle(train_data)
 
-    # print("\nInitial model evaluation before finetuning:")
-    # pre_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
-    # print(f"Pre-GRPO Accuracy: {pre_grpo_accuracy:.2f}%")
+    # Rank-specific seed so each GPU samples different batches
+    set_random_seed(42 + rank)
 
     model = optimize_model_memory(model)
 
-    # Reserve remaining GPU memory AFTER model is loaded to avoid fragmentation
-    print("Reserving GPU memory...")
-    reserve_gpu_memory()
-
-    print("\nStarting RL fine-tuning using M3PO (Multi-Path Perception Policy Optimization)...")
+    if is_main_process():
+        print("\nStarting RL fine-tuning using M3PO (Multi-Path Perception Policy Optimization)...")
     # This config follows the M3PO paper (Table 3, page 12)
-    # Tested on 8xA100 node with 80GB VRAM each
     training_config = {
         'num_iterations': 1,
         'num_steps': math.ceil(len(train_data) / 4),  # Full epoch
         'batch_size': 4,                   # 4 prompts per step (effective 16 with grad accum)
         'num_generations': 4,              # Paper uses 4 or 8 (using 4 for faster output)
-        'max_completion_length': 400,      # Reduced for 1x A100 40GB
+        'max_completion_length': 512,      # Reduced for 1x A100 40GB
         'beta': 0.005,                     # Paper value (KL penalty coefficient)
         'learning_rate': 5e-6,             # Paper value
         'mu': 2,                           # 2 gradient updates per rollout
@@ -988,47 +1049,76 @@ if __name__ == "__main__":
         # Gating function selection (for research on alternative gating mechanisms)
         'gating_type': 'luong',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
-            'temperature': 0.1,            # Will override temperature_m3po if gating is used
-            'rank': 256,                   # Reduced for 1x A100 40GB
-            'init_strategy': 'identity',   # 'identity' (QR-based) or 'xavier'
+            'temperature': 0.1,            # Target temperature (annealed to from 1.0)
+            'rank': 32,                    # Was 256 → fewer params, faster convergence
+            'init_strategy': 'xavier',     # Was 'identity' → breaks cosine-similarity basin
             'debug': False,                # Enable debug logging
         },
-        'gating_warmup_steps': 50,         # Fixed warmup: train only gating params for N steps
-        'gating_lr': 5e-4,                 # 100x model LR for randomly-initialized gating params
+        'gating_warmup_steps': 150,        # Was 50 → more time to diverge from baseline
+        'gating_lr': 1e-3,                 # Was 5e-4 → compensate for small gradients
         'gating_grad_clip': 1.0,           # Separate grad clip for gating (10x less aggressive)
         'gradient_accumulation_steps': 4,  # Paper Table 3
         'warmup_ratio': 0.1,              # Paper Table 3: cosine schedule with warmup
     }
 
-    # Initialize Weights & Biases
-    wandb.init(project=os.getenv("WANDB_PROJECT"), name=f"M3PO {training_config['gating_type']}", reinit=True)
-    print("Weights & Biases initialized.")
-    
+    # Initialize Weights & Biases (rank 0 only)
+    gating_type = training_config['gating_type']
+    trial_number = get_next_trial_number(base_output_dir, gating_type)
+    if is_main_process():
+        wandb.init(
+            project=os.getenv("WANDB_PROJECT"),
+            name=f"M3PO-{gating_type}-trial{trial_number}",
+            reinit=True
+        )
+        print(f"Weights & Biases initialized. Gating: {gating_type}, Trial: {trial_number}")
+
     model = train_with_grpo(
         model=model,
         tokenizer=tokenizer,
         train_data=train_data,
         reward_function=combined_reward,
-        device_ids=device_ids,
+        local_rank=local_rank,
         **training_config
     )
 
-    wandb.finish()
-    print("Training completed and wandb run finished.")
+    # Post-training: eval, save, push (rank 0 only)
+    if is_main_process():
+        wandb.finish()
+        print("Training completed and wandb run finished.")
 
-    print("\nFinal model evaluation after GRPO RL fine-tuning:")
-    post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
-    print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
+        print("\nFinal model evaluation after GRPO RL fine-tuning:")
+        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
+        print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
-    save_dir = training_config.get('output_dir', 'grpo_finetuned_model')
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"\nSaving GRPO fine-tuned model to {save_dir}...")
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
+        # Create structured output directory: output/{gating_type}/trial_{N}/
+        save_dir = os.path.join(base_output_dir, gating_type, f"trial_{trial_number}")
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"\nSaving GRPO fine-tuned model to {save_dir}...")
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
 
-    # Save training config and results for experiment tracking
-    serializable_config = {k: v for k, v in training_config.items() if isinstance(v, (int, float, str, bool, dict, list))}
-    with open(os.path.join(save_dir, "training_config.json"), "w") as f:
-        json.dump(serializable_config, f, indent=2)
-    with open(os.path.join(save_dir, "results.json"), "w") as f:
-        json.dump({"accuracy": post_grpo_accuracy}, f, indent=2)
+        # Save training config and results for experiment tracking
+        serializable_config = {k: v for k, v in training_config.items() if isinstance(v, (int, float, str, bool, dict, list))}
+        serializable_config['trial_number'] = trial_number
+        serializable_config['model_name'] = model_name
+        serializable_config['gating_type'] = gating_type
+        with open(os.path.join(save_dir, "training_config.json"), "w") as f:
+            json.dump(serializable_config, f, indent=2)
+        with open(os.path.join(save_dir, "results.json"), "w") as f:
+            json.dump({"accuracy": post_grpo_accuracy}, f, indent=2)
+
+        print(f"Model saved to: {save_dir}")
+
+        # Push to Hugging Face Hub
+        print("\nPushing model to Hugging Face Hub...")
+        from huggingface_hub import login
+        login(token=os.environ["HF_TOKEN"])
+        hf_repo = f"Alienpenguin10/M3PO-{gating_type}-trial{trial_number}"
+        model.push_to_hub(hf_repo)
+        tokenizer.push_to_hub(hf_repo)
+        print(f"Model pushed to Hugging Face Hub: {hf_repo}")
+
+    # Wait for rank 0 to finish saving, then clean up
+    if dist.is_initialized():
+        dist.barrier()
+    cleanup_ddp()
