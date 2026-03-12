@@ -295,8 +295,9 @@ def apply_m3po_to_logits(
         # Process positions in chunks; each chunk is recomputed during backward.
         thinking_mask = torch.ones(N, dtype=torch.bool, device=device)
         CHUNK_SIZE = 32  # positions per checkpoint segment
+        gating_params = list(gating_function.parameters())
 
-        def _blend_chunk(logits_chunk, thinking_mask, lambda_blend_t):
+        def _blend_chunk(logits_chunk, thinking_mask, lambda_blend_t, *extra_params):
             """Blend a chunk of positions. Called inside grad_checkpoint so intermediates
             are recomputed during backward instead of stored."""
             chunk_len = logits_chunk.shape[1]
@@ -332,7 +333,7 @@ def apply_m3po_to_logits(
 
             chunk = logits[:, start:end, :].contiguous()
             blended_chunk = grad_checkpoint(
-                _blend_chunk, chunk, thinking_mask, lambda_blend_t,
+                _blend_chunk, chunk, thinking_mask, lambda_blend_t, *gating_params,
                 use_reentrant=False,
             )
             blended_chunks.append(blended_chunk)
