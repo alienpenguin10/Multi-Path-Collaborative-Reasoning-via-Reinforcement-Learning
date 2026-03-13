@@ -19,6 +19,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+torch._dynamo.config.cache_size_limit = 32  # Avoid recompilation warnings with variable sequence lengths
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils.rnn import pad_sequence
 import datetime
@@ -724,6 +725,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
             # Phase 1: freeze model, train only gating params for fixed N steps
             for param in model.parameters():
                 param.requires_grad = False
+            # Keep gradient checkpointing enabled — disabling causes OOM on longer sequences
             gating_params_list = list(gating_function.parameters())
             if not gating_params_list:
                 raise RuntimeError(
@@ -736,7 +738,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 weight_decay=0.0,
                 betas=(0.9, 0.99),
             )
-            gating_function.set_temperature(1.0)  # High temp for gradient flow during warmup
+            # Temperature stays at config value (0.1) — identity init produces similarities in the right range
             if is_main_process():
                 print(f"[M3PO] Phase 1 (warmup): training only gating params for {gating_warmup_steps} steps at lr={effective_gating_lr}")
         else:
@@ -750,10 +752,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     weight_decay=0.1,
                     betas=(0.9, 0.99),
                 )
-                gating_function.set_temperature(1.0)  # High temp for gradient flow
                 phase2_optimizer_step_count = 0
-                temp_anneal_steps = 100
-                target_temperature = gating_config.get('temperature', 0.1) if gating_config else 0.1
             else:
                 params_to_optimize = list(model.parameters())
                 optimizer = bnb.optim.AdamW8bit(
@@ -765,6 +764,7 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         model.train()
 
         in_warmup_phase = has_learnable_gating and gating_warmup_steps > 0
+        gating_grad_verified = False
         total_steps = num_steps + (gating_warmup_steps if in_warmup_phase else 0)
 
         if in_warmup_phase:
@@ -813,8 +813,6 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     if p in old_gating_state:
                         optimizer.state[p] = old_gating_state[p]
                 phase2_optimizer_step_count = 0
-                temp_anneal_steps = 100
-                target_temperature = gating_config.get('temperature', 0.1) if gating_config else 0.1
                 # Cosine LR schedule with warmup for Phase 2 (paper Table 3)
                 # Model params: warmup from 0 → 5e-6 then cosine decay (newly unfrozen)
                 # Gating params: no warmup (already at 5e-4 from Phase 1), just cosine decay
@@ -868,6 +866,15 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 scaled_loss = loss / gradient_accumulation_steps
                 scaled_loss.backward()
 
+                # One-time verification that gating params receive gradients in Phase 1
+                if is_main_process() and in_warmup_phase and not gating_grad_verified:
+                    for name, p in gating_function.named_parameters():
+                        if p.grad is not None:
+                            print(f"[M3PO] Verified: {name} grad norm = {p.grad.norm().item():.6e}")
+                        else:
+                            print(f"[M3PO] WARNING: {name} has no gradient!")
+                    gating_grad_verified = True
+
                 # Sync learnable gating gradients across DDP ranks
                 if has_learnable_gating and dist.is_initialized():
                     for p in gating_function.parameters():
@@ -888,13 +895,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     scheduler.step()
                     optimizer.zero_grad()
 
-                    # Temperature annealing: linearly decay from 1.0 to target over first 100 Phase 2 steps
                     if has_learnable_gating and not in_warmup_phase:
                         phase2_optimizer_step_count += 1
-                        if phase2_optimizer_step_count <= temp_anneal_steps:
-                            progress = phase2_optimizer_step_count / temp_anneal_steps
-                            current_temp = 1.0 + (target_temperature - 1.0) * progress
-                            gating_function.set_temperature(current_temp)
 
                 # Log to wandb (rank 0 only)
                 if is_main_process():
@@ -1068,8 +1070,8 @@ if __name__ == "__main__":
         # Gating function selection (for research on alternative gating mechanisms)
         'gating_type': 'luong',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
-            'temperature': 0.1,            # Target temperature (annealed to from 1.0)
-            'rank': 32,                    # Was 256 → fewer params, faster convergence
+            'temperature': 0.1,            # T=0.1 throughout — identity init produces similarities in right range
+            'rank': 256,                   # Rank 256 for larger projection → stronger similarities at T=0.1
             'init_strategy': 'identity',    # Identity init: right numerical regime (~0.001 grad norms)
             'debug': False,                # Enable debug logging
         },

@@ -1,0 +1,13 @@
+Looking at this, you've got three distinct learning rate scheduling paths that handle the different training configurations. Let me walk through the logic in plain terms.
+
+**Path 1** is the most complex case. You're doing a two-phase training process. In the first phase (steps 0–149), only the gating parameters are being optimised — the base model is frozen. The gating params get a flat learning rate of 1e-3 with no decay, so they can learn their weights from scratch without interference from a simultaneously shifting base model. The maths checks out: 150 training steps with 2 mini-updates each, divided by 4 gradient accumulation steps, gives 75 actual optimiser steps all at that constant rate.
+
+At step 150, you tear down the old optimiser and build a new one with two parameter groups. The base model params come in at 5e-6 and the gating params stay at 1e-3. The key subtlety is the two different lambda schedules — the model params need a warmup ramp because they've been frozen and you don't want to shock them with full-magnitude updates immediately. The gating params skip warmup since they've already had 75 optimiser steps to settle, and go straight into cosine decay. The accumulator reset is safe because the phase boundary aligns cleanly with the gradient accumulation window (300 mod 4 = 0), so you're not discarding any partial gradients.
+
+**Path 2** is for when you want learnable gating but no phased warmup — both parameter groups start training together from step 0. A single lambda function handles both groups, giving them identical warmup-then-cosine-decay schedules. The base rates differ (5e-6 vs 1e-3) but the multiplicative schedule shape is the same. This is simpler but means the gating parameters and model parameters are co-adapting from the start, which risks the freshly initialised gating weights destabilising the pretrained model early on.
+
+**Path 3** is the parameter-free gating case (cosine similarity, dot product, etc.). There's only one parameter group — the base model at 5e-6 — with standard warmup into cosine decay. Temperature annealing is skipped entirely since there are no learnable gating parameters to anneal.
+
+The essential design principle across all three paths: freshly initialised parameters (gating weights, newly unfrozen model weights) always get either a warmup ramp or a dedicated pre-training phase before being exposed to the full training dynamics. This prevents random initial values from corrupting the pretrained model's representations through large, noisy gradient updates.
+
+Is there a specific aspect of the scheduling you want to dig into further, or were you mainly wanting confirmation that the three paths are correctly implemented?
