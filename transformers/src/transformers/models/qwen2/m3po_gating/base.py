@@ -58,10 +58,6 @@ class BaseM3POGating(ABC, nn.Module):
         """
         return False
 
-    def set_temperature(self, temperature: float):
-        """Update the temperature for attention weight computation."""
-        self.temperature = temperature
-
     @abstractmethod
     def compute_similarity_matrix(
         self,

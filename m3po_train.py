@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 torch._dynamo.config.cache_size_limit = 32  # Avoid recompilation warnings with variable sequence lengths
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(False)  # mem_efficient backend requires stride % 4 == 0
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils.rnn import pad_sequence
 import datetime
@@ -768,18 +770,19 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
         total_steps = num_steps + (gating_warmup_steps if in_warmup_phase else 0)
 
         if in_warmup_phase:
-            # Phase 1 uses fixed LR for gating warmup; Phase 2 scheduler created at transition
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+            # Phase 1: gating LR decays via single cosine over ALL optimizer steps (warmup + joint)
+            all_optimizer_steps = total_steps * mu // gradient_accumulation_steps
+            def lr_lambda_gating_phase1(current_step):
+                progress = current_step / max(1, all_optimizer_steps)
+                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_gating_phase1)
         else:
-            # No gating warmup — use cosine schedule with warmup for the full run (paper Table 3)
+            # No gating warmup — cosine decay only (no warmup) for the full run
             # scheduler.step() is called per optimizer step, not per outer step.
             # Each outer step does `mu` backwards; optimizer steps every `gradient_accumulation_steps`.
             phase2_total = num_steps * mu // gradient_accumulation_steps
-            phase2_warmup = int(phase2_total * warmup_ratio)
             def lr_lambda_full(current_step):
-                if current_step < phase2_warmup:
-                    return current_step / max(1, phase2_warmup)
-                progress = (current_step - phase2_warmup) / max(1, phase2_total - phase2_warmup)
+                progress = current_step / max(1, phase2_total)
                 return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_full)
 
@@ -813,19 +816,20 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                     if p in old_gating_state:
                         optimizer.state[p] = old_gating_state[p]
                 phase2_optimizer_step_count = 0
-                # Cosine LR schedule with warmup for Phase 2 (paper Table 3)
-                # Model params: warmup from 0 → 5e-6 then cosine decay (newly unfrozen)
-                # Gating params: no warmup (already at 5e-4 from Phase 1), just cosine decay
-                # Schedule length = number of optimizer steps in phase 2
+                # Cosine LR schedules for Phase 2 (no warmup)
+                # Model params: cosine decay from 1.0 over phase 2 steps
+                # Gating params: continue single cosine decay over ALL steps (warmup + joint)
                 phase2_total = num_steps * mu // gradient_accumulation_steps
-                phase2_warmup = int(phase2_total * warmup_ratio)
+                all_optimizer_steps = total_steps * mu // gradient_accumulation_steps
+                # gating_steps_so_far = optimizer steps already taken in Phase 1
+                gating_steps_so_far = gating_warmup_steps * mu // gradient_accumulation_steps
                 def lr_lambda_model(current_step):
-                    if current_step < phase2_warmup:
-                        return current_step / max(1, phase2_warmup)
-                    progress = (current_step - phase2_warmup) / max(1, phase2_total - phase2_warmup)
+                    progress = current_step / max(1, phase2_total)
                     return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
                 def lr_lambda_gating(current_step):
-                    progress = current_step / max(1, phase2_total)
+                    # Continue the single cosine curve from where Phase 1 left off
+                    effective_step = gating_steps_so_far + current_step
+                    progress = effective_step / max(1, all_optimizer_steps)
                     return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
                 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [lr_lambda_model, lr_lambda_gating])
                 optimizer.zero_grad()
@@ -1040,10 +1044,8 @@ if __name__ == "__main__":
     eval_data = prepare_dataset("test")
 
     # Use only half of the data for testing
-    train_data = train_data[:len(train_data)//2]
-    eval_data = eval_data[:len(eval_data)//2]
-
-    random.shuffle(train_data)
+    train_data = train_data[:len(train_data)//4]
+    eval_data = eval_data[:len(eval_data)//4]
 
     # Rank-specific seed so each GPU samples different batches
     set_random_seed(42 + rank)
@@ -1056,12 +1058,12 @@ if __name__ == "__main__":
     training_config = {
         'num_iterations': 1,
         'num_steps': math.ceil(len(train_data) / 4),  # Full epoch
-        'batch_size': 4,                   # 4 prompts per step (effective 16 with grad accum)
-        'num_generations': 4,              # Paper uses 4 or 8 (using 4 for faster output)
+        'batch_size': 4,                   # 4 prompts per step
+        'num_generations': 4,              # 4 rollouts per prompt
         'max_completion_length': 512,      # Reduced for 1x A100 40GB
         'beta': 0.005,                     # Paper value (KL penalty coefficient)
         'learning_rate': 5e-6,             # Paper value
-        'mu': 2,                           # 2 gradient updates per rollout
+        'mu': 1,                           # 1 gradient updates per rollout
         'epsilon': 0.1,
         # M3PO-specific parameters (from paper Table 3)
         'lambda_blend': 0.1,               # Blending coefficient λ
@@ -1075,8 +1077,8 @@ if __name__ == "__main__":
             'init_strategy': 'identity',    # Identity init: right numerical regime (~0.001 grad norms)
             'debug': False,                # Enable debug logging
         },
-        'gating_warmup_steps': 150,        # Was 50 → more time to diverge from baseline
-        'gating_lr': 1e-3,                 # Was 5e-4 → compensate for small gradients
+        'gating_warmup_steps': 50,         # Warmup steps for gating-only training
+        'gating_lr': 5e-4,                 # Gating learning rate
         'gating_grad_clip': 1.0,           # Separate grad clip for gating (10x less aggressive)
         'gradient_accumulation_steps': 4,  # Paper Table 3
         'warmup_ratio': 0.1,              # Paper Table 3: cosine schedule with warmup
