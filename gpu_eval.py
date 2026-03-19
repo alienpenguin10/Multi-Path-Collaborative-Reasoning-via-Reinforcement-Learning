@@ -33,8 +33,11 @@ def hold_gpus(gpu_ids):
     holders = []
     for gid in gpu_ids:
         dev = torch.device(f"cuda:{gid}")
-        # Allocate ~1 GB to mark the GPU as in-use
-        t = torch.zeros(256, 1024, 1024, device=dev)
+        # Allocate ~5 GB to mark the GPU as in-use
+        # 1024*1024*5 = 5,242,880 floats (float32 = 4 bytes) ≈ 20.97MB, so we need 5*1024 MB / 4 = 1,280,000,000 floats
+        # To allocate 5GB, use float32: 5 * 1024**3 / 4 = 1,342,177,280 elements
+        # Let's use a shape that fits: e.g., (640, 1024, 1920) ~5GB (640*1024*1920*4 bytes ≈ 5GB)
+        t = torch.zeros(640, 1024, 1920, device=dev)
         holders.append(t)
         print(f"  Holding GPU {gid}")
     return holders

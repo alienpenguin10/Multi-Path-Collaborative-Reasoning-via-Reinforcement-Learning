@@ -14,15 +14,24 @@ import sys
 
 # Must be set before any CUDA operations to prevent memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Must be set before CUDA init for cuBLAS determinism
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+# Force NCCL to use deterministic ring algorithm (tree/default can vary reduction order)
+os.environ["NCCL_ALGO"] = "Ring"
+os.environ["NCCL_PROTO"] = "Simple"
 
 # PyTorch and related libraries for deep learning
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-torch._dynamo.config.cache_size_limit = 32  # Avoid recompilation warnings with variable sequence lengths
-torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_flash_sdp(False)  # Flash SDP is non-deterministic in backward pass
 torch.backends.cuda.enable_mem_efficient_sdp(False)  # mem_efficient backend requires stride % 4 == 0
-from torch.nn.parallel import DistributedDataParallel as DDP
+torch.backends.cuda.enable_math_sdp(True)  # Math SDP is deterministic
+# Disable reduced-precision reductions — bf16 accumulation order can vary
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 from torch.nn.utils.rnn import pad_sequence
 import datetime
 import bitsandbytes as bnb
@@ -406,6 +415,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
         prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_mask.repeat_interleave(num_generations, dim=0)
 
+        model.eval()  # Prevent check_model_inputs from forcing use_cache=False during generation
         outputs = model.generate(
             prompt_ids,
             attention_mask=prompt_mask,
@@ -415,6 +425,7 @@ def generate_completions(model, tokenizer, prompts, num_generations=4, max_compl
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
+        model.train()  # Restore training mode for subsequent compute_log_probs
 
     # print(f"Output batch size: {outputs.size(0)}, Device after model: {outputs.device}")
     completion_ids = outputs[:, prompt_length:]
@@ -684,19 +695,20 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 print(f"[M3PO] Falling back to baseline (cosine similarity)")
             gating_function = None
 
-    # Wrap model with DDP if distributed training is active.
+    # Move model to device and sync parameters across ranks.
     model.to(device)
     if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        # Broadcast model parameters from rank 0 so all ranks start with same weights
+        for p in model.parameters():
+            dist.broadcast(p.data, src=0)
         if is_main_process():
-            print(f"Model wrapped with DDP across {dist.get_world_size()} GPUs")
+            print(f"Manual gradient sync across {dist.get_world_size()} GPUs")
     else:
         print(f"Running on single GPU: {device}")
 
-    raw_model = model.module if dist.is_initialized() else model
+    raw_model = model
 
-    # torch.compile for faster forward/backward (generation skips via torch.compiler.disable)
-    compiled_model = torch.compile(raw_model)
+    compiled_model = raw_model  # torch.compile disabled — causes sdpa stride/dynamo issues
 
     # Outer loop: iterative GRPO updates.
     try:
@@ -870,6 +882,12 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                 scaled_loss = loss / gradient_accumulation_steps
                 scaled_loss.backward()
 
+                # Sync model gradients across ranks (replaces DDP's automatic all_reduce)
+                if dist.is_initialized():
+                    for p in raw_model.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
                 # One-time verification that gating params receive gradients in Phase 1
                 if is_main_process() and in_warmup_phase and not gating_grad_verified:
                     for name, p in gating_function.named_parameters():
@@ -879,11 +897,12 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                             print(f"[M3PO] WARNING: {name} has no gradient!")
                     gating_grad_verified = True
 
-                # Sync learnable gating gradients across DDP ranks
+                # Sync learnable gating gradients across ranks
                 if has_learnable_gating and dist.is_initialized():
                     for p in gating_function.parameters():
-                        if p.grad is not None:
-                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
                 accum_count += 1
 
@@ -1060,7 +1079,7 @@ if __name__ == "__main__":
         'num_steps': math.ceil(len(train_data) / 4),  # Full epoch
         'batch_size': 4,                   # 4 prompts per step
         'num_generations': 4,              # 4 rollouts per prompt
-        'max_completion_length': 512,      # Reduced for 1x A100 40GB
+        'max_completion_length': 400,      # Reduced for 1x A100 40GB
         'beta': 0.005,                     # Paper value (KL penalty coefficient)
         'learning_rate': 5e-6,             # Paper value
         'mu': 1,                           # 1 gradient updates per rollout
@@ -1070,11 +1089,11 @@ if __name__ == "__main__":
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
         # Gating function selection (for research on alternative gating mechanisms)
-        'gating_type': 'luong',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
+        'gating_type': 'kl_divergence',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # T=0.1 throughout — identity init produces similarities in right range
-            'rank': 256,                   # Rank 256 for larger projection → stronger similarities at T=0.1
-            'init_strategy': 'identity',    # Identity init: right numerical regime (~0.001 grad norms)
+            'rank': 64,                   # Rank 256 for larger projection → stronger similarities at T=0.1
+            'init_strategy': 'xavier',    # Identity init: right numerical regime (~0.001 grad norms)
             'debug': False,                # Enable debug logging
         },
         'gating_warmup_steps': 50,         # Warmup steps for gating-only training
@@ -1104,14 +1123,11 @@ if __name__ == "__main__":
         **training_config
     )
 
-    # Post-training: eval, save, push (rank 0 only)
-    if is_main_process():
+    # Post-training: save, push, then eval (rank 0 only)
+    # Other ranks wait at the barrier below until rank 0 finishes.
+    if local_rank == 0:
         wandb.finish()
         print("Training completed and wandb run finished.")
-
-        print("\nFinal model evaluation after GRPO RL fine-tuning:")
-        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
-        print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
         # Create structured output directory: output/{gating_type}/trial_{N}/
         save_dir = os.path.join(base_output_dir, gating_type, f"trial_{trial_number}")
@@ -1120,15 +1136,13 @@ if __name__ == "__main__":
         model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
 
-        # Save training config and results for experiment tracking
+        # Save training config for experiment tracking
         serializable_config = {k: v for k, v in training_config.items() if isinstance(v, (int, float, str, bool, dict, list))}
         serializable_config['trial_number'] = trial_number
         serializable_config['model_name'] = model_name
         serializable_config['gating_type'] = gating_type
         with open(os.path.join(save_dir, "training_config.json"), "w") as f:
             json.dump(serializable_config, f, indent=2)
-        with open(os.path.join(save_dir, "results.json"), "w") as f:
-            json.dump({"accuracy": post_grpo_accuracy}, f, indent=2)
 
         print(f"Model saved to: {save_dir}")
 
@@ -1141,7 +1155,16 @@ if __name__ == "__main__":
         tokenizer.push_to_hub(hf_repo)
         print(f"Model pushed to Hugging Face Hub: {hf_repo}")
 
-    # Wait for rank 0 to finish saving, then clean up
+        # Evaluate after save/push so model is preserved even if eval fails
+        print("\nFinal model evaluation after GRPO RL fine-tuning:")
+        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
+        print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
+
+        # Save results alongside config
+        with open(os.path.join(save_dir, "results.json"), "w") as f:
+            json.dump({"accuracy": post_grpo_accuracy}, f, indent=2)
+
+    # Barrier AFTER rank 0 finishes save/push/eval so other ranks don't exit early
     if dist.is_initialized():
         dist.barrier()
-    cleanup_ddp()
+        cleanup_ddp()

@@ -201,22 +201,23 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Load the saved model and tokenizer
-    saved_model_path = "outputs/kl_divergence"
+    saved_model_path = "output/luong/trial_1"
 
     # Load the model
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         saved_model_path,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto"
     )
     print("Model loaded successfully!")
 
-    tokenizer = AutoTokenizer.from_pretrained(saved_model_path, fix_mistral_regex=True)
+    tokenizer = AutoTokenizer.from_pretrained(saved_model_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
 
     # Define test prompts
-    eval_data = prepare_dataset("test") 
+    eval_data = prepare_dataset("test")
+    eval_data = eval_data[:len(eval_data)//4]  # 329 examples, matching training eval subset
 
 
     import json
@@ -227,7 +228,7 @@ if __name__ == "__main__":
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
     results = {
-        "gating_type": "kl_divergence",
+        "gating_type": "luong",
         "accuracy": post_grpo_accuracy,
         "eval_size": len(eval_data),
         "model_path": saved_model_path,

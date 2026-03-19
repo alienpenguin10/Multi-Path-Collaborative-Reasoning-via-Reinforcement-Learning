@@ -54,6 +54,9 @@ def set_random_seed(seed: int = 42):
     # Ensure deterministic behavior in cuDNN (may impact performance)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # Force deterministic algorithms for all CUDA ops (scatter, gather, index_add, etc.)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
 
 # Find next available trial number
 def get_next_trial_number(base_dir, gating_name):
