@@ -46,7 +46,8 @@ from dotenv import load_dotenv
 load_dotenv()
 # Call the function to set random seed for reproducibility
 from utils import set_random_seed, get_next_trial_number
-set_random_seed(42)
+BASE_SEED = 42
+set_random_seed(BASE_SEED)
 
 
 # Set environment variables for Weights & Biases (wandb) logging
@@ -629,7 +630,8 @@ def train_with_grpo(model, tokenizer, train_data, num_iterations=1, num_steps=50
                               lambda_blend=0.1, temperature_m3po=0.1, use_m3po=True,
                               gating_type='baseline', gating_config=None,
                               gating_warmup_steps=0, gating_lr=None, gating_grad_clip=None,
-                              gradient_accumulation_steps=1, warmup_ratio=0.1):
+                              gradient_accumulation_steps=1, warmup_ratio=0.1,
+                              seed=None):
     """
     Train with GRPO + M3PO (Multi-Path Perception Policy Optimization).
 
@@ -1042,7 +1044,7 @@ if __name__ == "__main__":
         print(f"DDP initialized: {world_size} GPU(s), primary device: {device}")
 
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    base_output_dir = "output"
+    base_output_dir = "outputs"
 
     if is_main_process():
         print(f"Loading model from {model_name}...")
@@ -1067,12 +1069,13 @@ if __name__ == "__main__":
     eval_data = eval_data[:len(eval_data)//4]
 
     # Rank-specific seed so each GPU samples different batches
-    set_random_seed(42 + rank)
+    set_random_seed(BASE_SEED + rank)
 
     model = optimize_model_memory(model)
 
     if is_main_process():
         print("\nStarting RL fine-tuning using M3PO (Multi-Path Perception Policy Optimization)...")
+        
     # This config follows the M3PO paper (Table 3, page 12)
     training_config = {
         'num_iterations': 1,
@@ -1089,7 +1092,7 @@ if __name__ == "__main__":
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
         # Gating function selection (for research on alternative gating mechanisms)
-        'gating_type': 'kl_divergence',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
+        'gating_type': 'raw_dot',         # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'luong', 'bahdanau'
         'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # T=0.1 throughout — identity init produces similarities in right range
             'rank': 64,                   # Rank 256 for larger projection → stronger similarities at T=0.1
@@ -1101,18 +1104,21 @@ if __name__ == "__main__":
         'gating_grad_clip': 1.0,           # Separate grad clip for gating (10x less aggressive)
         'gradient_accumulation_steps': 4,  # Paper Table 3
         'warmup_ratio': 0.1,              # Paper Table 3: cosine schedule with warmup
+        'seed': BASE_SEED,                 # Base seed; each rank uses seed + rank
     }
 
     # Initialize Weights & Biases (rank 0 only)
     gating_type = training_config['gating_type']
+    seed = training_config['seed']
     trial_number = get_next_trial_number(base_output_dir, gating_type)
     if is_main_process():
         wandb.init(
             project=os.getenv("WANDB_PROJECT"),
-            name=f"M3PO-{gating_type}-trial{trial_number}",
+            name=f"M3PO-{gating_type}-trial{trial_number}-seed{seed}",
+            config=training_config,
             reinit=True
         )
-        print(f"Weights & Biases initialized. Gating: {gating_type}, Trial: {trial_number}")
+        print(f"Weights & Biases initialized. Gating: {gating_type}, Trial: {trial_number}, Seed: {seed}")
 
     model = train_with_grpo(
         model=model,
@@ -1130,7 +1136,7 @@ if __name__ == "__main__":
         print("Training completed and wandb run finished.")
 
         # Create structured output directory: output/{gating_type}/trial_{N}/
-        save_dir = os.path.join(base_output_dir, gating_type, f"trial_{trial_number}")
+        save_dir = os.path.join(base_output_dir, gating_type, f"trial_{trial_number}_seed{seed}")
         os.makedirs(save_dir, exist_ok=True)
         print(f"\nSaving GRPO fine-tuned model to {save_dir}...")
         model.save_pretrained(save_dir)
@@ -1150,19 +1156,25 @@ if __name__ == "__main__":
         print("\nPushing model to Hugging Face Hub...")
         from huggingface_hub import login
         login(token=os.environ["HF_TOKEN"])
-        hf_repo = f"Alienpenguin10/M3PO-{gating_type}-trial{trial_number}"
+        hf_repo = f"Alienpenguin10/M3PO-{gating_type}-trial{trial_number}-seed{seed}"
         model.push_to_hub(hf_repo)
         tokenizer.push_to_hub(hf_repo)
+        from huggingface_hub import upload_file
+        upload_file(
+            path_or_fileobj=os.path.join(save_dir, "training_config.json"),
+            path_in_repo="training_config.json",
+            repo_id=hf_repo,
+        )
         print(f"Model pushed to Hugging Face Hub: {hf_repo}")
 
-        # Evaluate after save/push so model is preserved even if eval fails
-        print("\nFinal model evaluation after GRPO RL fine-tuning:")
-        post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
-        print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
+        # # Evaluate after save/push so model is preserved even if eval fails
+        # print("\nFinal model evaluation after GRPO RL fine-tuning:")
+        # post_grpo_accuracy = evaluate_model(model, tokenizer, eval_data, device)
+        # print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
-        # Save results alongside config
-        with open(os.path.join(save_dir, "results.json"), "w") as f:
-            json.dump({"accuracy": post_grpo_accuracy}, f, indent=2)
+        # # Save results alongside config
+        # with open(os.path.join(save_dir, "results.json"), "w") as f:
+        #     json.dump({"accuracy": post_grpo_accuracy, "seed": seed}, f, indent=2)
 
     # Barrier AFTER rank 0 finishes save/push/eval so other ranks don't exit early
     if dist.is_initialized():

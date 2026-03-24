@@ -7,7 +7,9 @@ import math
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["M3PO_DEBUG"] = "-1"
 
-sys.path.insert(0, os.path.abspath("transformers/src"))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "transformers", "src"))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
