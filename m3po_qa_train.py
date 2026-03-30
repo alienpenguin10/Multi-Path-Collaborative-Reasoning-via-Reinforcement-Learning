@@ -45,8 +45,8 @@ os.environ["M3PO_DEBUG"] = "-1"  # Disable M3PO debug prints (set to "1" to enab
 from dotenv import load_dotenv
 load_dotenv()
 # Call the function to set random seed for reproducibility
-from utils import set_random_seed, get_next_trial_number
-BASE_SEED = 123
+from utils_qa import set_random_seed, get_next_trial_number
+BASE_SEED = 42
 set_random_seed(BASE_SEED)
 
 
@@ -57,23 +57,23 @@ os.environ["WANDB_PROJECT"] = os.getenv("WANDB_PROJECT")
 """
 Part 2: Data Formatting and Answer Extraction
 """
-from utils import extract_answer_from_model_output
+from utils_qa import extract_answer_from_model_output
 
 """
 Part 3: Dataset Preparation
 """
-from utils import prepare_dataset
+from utils_qa import prepare_dataset
 
 
 """
 Part 4: Evaluation Functions
 """
-from utils import evaluate_model
+from utils_qa import evaluate_model
 
 """
 Part 5: Reward Functions
 """
-from utils import combined_reward
+from utils_qa import combined_reward
 
 """
 Part 6: DDP Helpers
@@ -464,7 +464,7 @@ def generate_rollout_data(model, ref_model, tokenizer, batch_samples, num_genera
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prompts = [sample["prompt"] if isinstance(sample, dict) else sample[0] for sample in batch_samples]
-    answers = [sample["answer"] if isinstance(sample, dict) else sample[1] for sample in batch_samples]
+    answers = [sample["answers"] if isinstance(sample, dict) else sample[1] for sample in batch_samples]
     with torch.no_grad():
         prompt_ids, prompt_mask, completion_ids, completion_mask = generate_completions(
             model, tokenizer, prompts, num_generations, max_completion_length,
@@ -1061,12 +1061,9 @@ if __name__ == "__main__":
     model.config.pad_token_id = tokenizer.eos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
 
-    train_data = prepare_dataset("train")
-    eval_data = prepare_dataset("test")
-
-    # Use only half of the data for testing
-    train_data = train_data[:len(train_data)//4]
-    eval_data = eval_data[:len(eval_data)//4]
+    # Load TriviaQA: 10K training examples, 2K validation examples
+    train_data = prepare_dataset("train", max_examples=10000)
+    eval_data = prepare_dataset("validation", max_examples=2000)
 
     # Rank-specific seed so each GPU samples different batches
     set_random_seed(BASE_SEED + rank)
@@ -1077,9 +1074,10 @@ if __name__ == "__main__":
         print("\nStarting RL fine-tuning using M3PO (Multi-Path Perception Policy Optimization)...")
         
     # This config follows the M3PO paper (Table 3, page 12)
+    num_epochs = 2
     training_config = {
         'num_iterations': 1,
-        'num_steps': math.ceil(len(train_data) / 4),  # Full epoch
+        'num_steps': math.ceil(len(train_data) / 4) * num_epochs,  # 2 epochs over 10K examples
         'batch_size': 4,                   # 4 prompts per step
         'num_generations': 4,              # 4 rollouts per prompt
         'max_completion_length': 400,      # Reduced for 1x A100 40GB
@@ -1088,18 +1086,18 @@ if __name__ == "__main__":
         'mu': 1,                           # 1 gradient updates per rollout
         'epsilon': 0.1,
         # M3PO-specific parameters (from paper Table 3)
-        'lambda_blend': 0.3,               # Blending coefficient λ
+        'lambda_blend': 0.1,               # Blending coefficient λ
         'temperature_m3po': 0.1,           # Attention temperature T
-        'use_m3po': True,                  # Enable M3PO cross-path interaction
+        'use_m3po': False,                  # Enable M3PO cross-path interaction
         # Gating function selection (for research on alternative gating mechanisms)
         'gating_type': 'bhattacharyya',     # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'bhattacharyya', 'luong', 'bahdanau'
-         'gating_config': {                 # Configuration for gating function
-            'temperature': 0.1,            # T=0.1 throughout — identity init produces similarities in right range
-            'rank': 256,                   # Projection dim for Luong (W shape: vocab_size x rank)
-            'attn_dim': 512,               # Projection dim for Bahdanau (W1/W2 shape: attn_dim x vocab_size)
-            'init_strategy': 'xavier',    # Identity init: right numerical regime (~0.001 grad norms)
-            'debug': False,                # Enable debug logging
-        },
+        #  'gating_config': {                 # Configuration for gating function
+        #     'temperature': 0.1,            # T=0.1 throughout — identity init produces similarities in right range
+        #     'rank': 128,                   # Projection dim for Luong (W shape: vocab_size x rank)
+        #     'attn_dim': 512,               # Projection dim for Bahdanau (W1/W2 shape: attn_dim x vocab_size)
+        #     'init_strategy': 'xavier',    # Identity init: right numerical regime (~0.001 grad norms)
+        #     'debug': False,                # Enable debug logging
+        # },
         'gating_warmup_steps': 50,          # No learnable params — warmup not needed
         'gating_lr': 5e-4,                 # Gating learning rate (unused for parameter-free gates)
         'gating_grad_clip': 1.0,           # Separate grad clip for gating (unused for parameter-free gates)
@@ -1111,11 +1109,11 @@ if __name__ == "__main__":
     # Initialize Weights & Biases (rank 0 only)
     gating_type = training_config['gating_type']
     seed = training_config['seed']
-    trial_number = get_next_trial_number(base_output_dir, gating_type)
+    trial_number = get_next_trial_number(base_output_dir, f"TriviaQA_{gating_type}")
     if is_main_process():
         wandb.init(
             project=os.getenv("WANDB_PROJECT"),
-            name=f"M3PO-{gating_type}-trial{trial_number}-seed{seed}",
+            name=f"M3PO-TriviaQA-{gating_type}-trial{trial_number}-seed{seed}",
             config=training_config,
             reinit=True
         )
@@ -1137,7 +1135,7 @@ if __name__ == "__main__":
         print("Training completed and wandb run finished.")
 
         # Create structured output directory: output/{gating_type}/trial_{N}/
-        save_dir = os.path.join(base_output_dir, gating_type, f"trial_{trial_number}_seed{seed}")
+        save_dir = os.path.join(base_output_dir, f"TriviaQA_{gating_type}", f"trial_{trial_number}_seed{seed}")
         os.makedirs(save_dir, exist_ok=True)
         print(f"\nSaving GRPO fine-tuned model to {save_dir}...")
         model.save_pretrained(save_dir)
@@ -1157,7 +1155,7 @@ if __name__ == "__main__":
         print("\nPushing model to Hugging Face Hub...")
         from huggingface_hub import login, upload_file
         login(token=os.environ["HF_TOKEN"])
-        hf_repo = f"Alienpenguin10/M3PO-{gating_type}-trial{trial_number}-seed{seed}"
+        hf_repo = f"Alienpenguin10/M3PO-TriviaQA-{gating_type}-trial{trial_number}-seed{seed}"
 
         import time
         for attempt in range(1, 6):

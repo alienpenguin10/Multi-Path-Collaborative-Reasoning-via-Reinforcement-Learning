@@ -401,9 +401,11 @@ def generate_with_m3po(
     gating_function=None,                # Optional: Alternative gating function (BaseM3POGating)
 ) -> torch.Tensor:
     """
-    Generate with M3PO - cleaner implementation.
+    Generate with M3PO using KV-cached decoding.
 
-    Uses inputs_embeds for the entire generation to allow M3PO blending.
+    Prefills the KV cache with prompt embeddings, then decodes one token at a time
+    with M3PO-blended embeddings. Past KV states are unaffected by current-step
+    blending, so caching is mathematically equivalent to full recomputation.
     """
     debug = os.environ.get('M3PO_DEBUG', '0') == '1'
 
@@ -432,28 +434,29 @@ def generate_with_m3po(
     thinking_mask = [True] * total_paths
     finished = torch.zeros(total_paths, dtype=torch.bool, device=device)
 
-    # No KV cache when using inputs_embeds (simpler but slower)
-    # For production, you'd want to optimize this
-
     if debug:
         print(f"[M3PO GEN v2] Starting: batch={batch_size}, N={num_generations}, total={total_paths}")
 
+    # Disable gradient checkpointing for generation — it forces use_cache=False
+    was_training = model.training
+    model.eval()
+
+    # Prefill: process entire prompt, initialize KV cache
+    outputs = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=expanded_attention_mask,
+        use_cache=True,
+    )
+    past_key_values = outputs.past_key_values
+    current_logits = outputs.logits[:, -1, :]  # (total_paths, vocab_size)
+    del inputs_embeds, outputs  # free prompt embeddings, now encoded in KV cache
+
     for step in range(max_new_tokens):
-        # Forward pass with embeddings
-        outputs = model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=expanded_attention_mask,
-            use_cache=False,  # Disable cache for simplicity with embeddings
-        )
-
-        # Get logits for last position
-        logits = outputs.logits[:, -1, :]  # (total_paths, vocab_size)
-
         # Temperature for sampling
         if temperature_sampling != 1.0:
-            sample_logits = logits / temperature_sampling
+            sample_logits = current_logits / temperature_sampling
         else:
-            sample_logits = logits
+            sample_logits = current_logits
 
         # Sample tokens
         probs = F.softmax(sample_logits, dim=-1)
@@ -469,14 +472,11 @@ def generate_with_m3po(
                 if tok in thinking_end_tokens:
                     thinking_mask[i] = False
 
-        # Get token embeddings
-        next_embeds = embed_tokens(next_tokens)  # (total_paths, hidden_dim)
-
         # Apply M3PO if any paths still thinking
         if any(thinking_mask) and lambda_blend > 0:
             # Compute attention from output distributions
             blended_embeds = apply_m3po_step(
-                logits=logits,  # Original logits for similarity
+                logits=current_logits,  # Original logits for similarity
                 embed_tokens=embed_tokens,
                 sampled_tokens=next_tokens,
                 config=config,
@@ -485,16 +485,24 @@ def generate_with_m3po(
             )
             # Shape: (total_paths, 1, hidden_dim)
         else:
+            next_embeds = embed_tokens(next_tokens)  # (total_paths, hidden_dim)
             blended_embeds = next_embeds.unsqueeze(1)
 
-        # Append to sequence embeddings
-        inputs_embeds = torch.cat([inputs_embeds, blended_embeds], dim=1)
-
-        # Update attention mask
+        # Update attention mask (must include all cached + new positions)
         expanded_attention_mask = torch.cat([
             expanded_attention_mask,
             torch.ones(total_paths, 1, device=device, dtype=expanded_attention_mask.dtype)
         ], dim=1)
+
+        # Single-token decode with KV cache
+        outputs = model(
+            inputs_embeds=blended_embeds,           # (total_paths, 1, hidden_dim)
+            attention_mask=expanded_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        current_logits = outputs.logits[:, -1, :]  # (total_paths, vocab_size)
 
         # Track generated tokens
         generated_ids = torch.cat([generated_ids, next_tokens.unsqueeze(-1)], dim=1)
@@ -506,7 +514,11 @@ def generate_with_m3po(
 
         if debug and step < 3:
             active = sum(thinking_mask)
-            print(f"[M3PO GEN v2] Step {step}: {active}/{total_paths} thinking, seq_len={inputs_embeds.shape[1]}")
+            print(f"[M3PO GEN v2] Step {step}: {active}/{total_paths} thinking")
+
+    # Restore training mode for subsequent loss computation
+    if was_training:
+        model.train()
 
     return generated_ids
 

@@ -5,25 +5,19 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath("transformers/src"))
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from utils import SYSTEM_PROMPT, build_prompt, extract_answer_from_model_output, extract_single_number, extract_last_number, prepare_dataset, set_random_seed
+from utils_qa import (
+    SYSTEM_PROMPT, build_prompt, extract_answer_from_model_output,
+    normalize_answer, prepare_dataset, set_random_seed,
+)
 import torch
 
 BASE_SEED = 42
 set_random_seed(BASE_SEED)
 
-def check_correct(predicted, expected):
-    """Check if predicted answer matches expected using multiple methods."""
-    if predicted == expected:
-        return True
-    # Try single number matching
-    pred_num = extract_single_number(str(predicted))
-    exp_num = extract_single_number(str(expected))
-    if pred_num is not None and exp_num is not None and pred_num == exp_num:
-        return True
-    # Try last number matching
-    pred_num = extract_last_number(str(predicted))
-    exp_num = extract_last_number(str(expected))
-    return pred_num is not None and exp_num is not None and pred_num == exp_num
+
+def check_correct(predicted, expected_answers):
+    """Check if predicted answer matches any of the expected answers (normalized)."""
+    return normalize_answer(predicted) in set(expected_answers)
 
 
 def evaluate_model(model, tokenizer, eval_examples, device, batch_size=16):
@@ -33,7 +27,8 @@ def evaluate_model(model, tokenizer, eval_examples, device, batch_size=16):
     Args:
         model: The language model to evaluate.
         tokenizer: The tokenizer for encoding inputs and decoding outputs.
-        eval_examples (list): List of evaluation examples, each containing "prompt" and "answer".
+        eval_examples (list): List of evaluation examples, each containing
+                              "prompt" and "answers" (list of normalized strings).
         device: The device (CPU or GPU) to run evaluation on.
         batch_size (int): Number of examples to process in each batch.
 
@@ -43,20 +38,19 @@ def evaluate_model(model, tokenizer, eval_examples, device, batch_size=16):
     model.eval()
     correct = 0
     total = len(eval_examples)
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("EVALUATION ON", total, "EXAMPLES")
-    print("="*50)
+    print("=" * 50)
 
     for batch_start in range(0, total, batch_size):
         batch_end = min(batch_start + batch_size, total)
         batch = eval_examples[batch_start:batch_end]
         prompts = [ex["prompt"] for ex in batch]
-        expected_answers = [ex["answer"] for ex in batch]
+        expected_answers_list = [ex["answers"] for ex in batch]
 
         print(f"Evaluating batch {batch_start//batch_size + 1}/{(total + batch_size - 1)//batch_size} "
               f"(examples {batch_start+1}-{batch_end}/{total})...", end=" ", flush=True)
 
-        # Tokenize batch with left-padding for generation
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
         with torch.no_grad():
             outputs = model.generate(
@@ -71,15 +65,14 @@ def evaluate_model(model, tokenizer, eval_examples, device, batch_size=16):
             )
         print("Done", flush=True)
 
-        # Decode and score each response in the batch
-        for i, (output_ids, expected) in enumerate(zip(outputs, expected_answers)):
+        for i, (output_ids, expected_answers) in enumerate(zip(outputs, expected_answers_list)):
             response = tokenizer.decode(output_ids, skip_special_tokens=True)
             try:
                 predicted = extract_answer_from_model_output(response)
-                is_correct = check_correct(predicted, expected)
+                is_correct = check_correct(predicted, expected_answers)
                 if is_correct:
                     correct += 1
-                print(expected)
+                print(expected_answers[0] if expected_answers else "")
                 print(predicted)
                 print("\nCorrect:", "✓" if is_correct else "✗")
             except Exception as e:
@@ -91,14 +84,11 @@ def evaluate_model(model, tokenizer, eval_examples, device, batch_size=16):
 
 
 if __name__ == "__main__":
-    # Determine the device: use GPU if available, else fallback to CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}") 
+    print(f"Using device: {device}")
 
-    # Load the saved model and tokenizer
-    saved_model_path = "outputs/MAIN-M3PO-bhattacharyya-trial1-seed123" #kl_divergence
+    saved_model_path = "outputs/bahdanau/trial_1_seed42"
 
-    # Load the model
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         saved_model_path,
@@ -110,10 +100,8 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(saved_model_path, padding_side="left", fix_mistral_regex=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Define test prompts
-    eval_data = prepare_dataset("test")
-    eval_data = eval_data[:len(eval_data)//4]  # 329 examples, matching training eval subset
-
+    # Load TriviaQA validation split (up to 2000 examples)
+    eval_data = prepare_dataset("validation", max_examples=2000)
 
     import json
     from datetime import datetime
@@ -128,7 +116,7 @@ if __name__ == "__main__":
     print(f"Post-GRPO Accuracy: {post_grpo_accuracy:.2f}%")
 
     results = {
-        "gating_type": "GRPO",
+        "dataset": "trivia_qa/rc.nocontext",
         "accuracy": post_grpo_accuracy,
         "eval_size": len(eval_data),
         "model_path": saved_model_path,
