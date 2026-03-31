@@ -1092,7 +1092,7 @@ if __name__ == "__main__":
         'temperature_m3po': 0.1,           # Attention temperature T
         'use_m3po': True,                  # Enable M3PO cross-path interaction
         # Gating function selection (for research on alternative gating mechanisms)
-        'gating_type': 'bhattacharyya',     # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'bhattacharyya', 'luong', 'bahdanau'
+        'gating_type': 'luong',     # Options: 'baseline', 'raw_dot', 'scaled_dot', 'kl_divergence', 'bhattacharyya', 'luong', 'bahdanau'
          'gating_config': {                 # Configuration for gating function
             'temperature': 0.1,            # T=0.1 throughout — identity init produces similarities in right range
             'rank': 256,                   # Projection dim for Luong (W shape: vocab_size x rank)
