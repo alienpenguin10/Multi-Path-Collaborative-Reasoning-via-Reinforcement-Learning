@@ -95,8 +95,9 @@ def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 """
-Part 7: DDP GRPO From Scratch
-In this section, we implement all the building blocks of the GRPO algorithm from scratch. 
+Part 7: DDP GRPO
+In this section, we implement all the building blocks of the GRPO algorithm. 
+Parts of the code is burrowed from: https://github.com/aburkov/theLMbook/blob/main/GRPO_From_Scratch_Multi_GPU_DataParallel_Qwen_2_5_1_5B_Instruct.ipynb
 The implementation assumes that the machine running the code has at least 2 GPUs. 
 We use PyTorch's DistributedDataParallel (DDP) to distribute the policy model across GPUs, one process per GPU. Each process trains on different data and gradients are synchronized via ring-allreduce.
 """
